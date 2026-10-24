@@ -184,7 +184,7 @@ ctest --test-dir build --output-on-failure
 - 每个 `test_*.cpp` 编译成独立可执行 + 独立 ctest 用例：一个用例崩了不会拖垮其余用例。
 - CI 建议额外打开 `-DQZRPC_WERROR=ON`，把"零警告"变成构建的硬门槛。
 
-当前 9 个 ctest 用例（括号里是断言数，`ctest` 只报通过/失败，断言数要看用例自己的输出）：
+当前 13 个 ctest 用例（括号里是断言数，`ctest` 只报通过/失败，断言数要看用例自己的输出）：
 
 | 用例 | 断言 | 覆盖什么 | 依赖外部工具 |
 | --- | ---: | --- | --- |
@@ -194,9 +194,17 @@ ctest --test-dir build --output-on-failure
 | `test_codec` | 458 | 整帧编解码、粘包半包、任意位置切分、`PeekFrameSize` | 无 |
 | `test_frame_metadata` | 510 | 帧头逐字节、flags 真值表、metadata TLV 与扩展键边界 | 无 |
 | `test_service_registry` | 95 | 方法目录、method_id 重算比对（L2）、冲突与幂等 | 无 |
+| `test_load_balancer` | 7460 | 轮询/随机/一致性哈希：分发均匀性（200 线程并发）、重试换实例、短 key 分散、并发刷新 | 无 |
+| `test_thread_pool` | 796 | 有界队列拒绝、调用者运行、Stop 排空/丢弃、计数一致性 | 无 |
+| `test_timer_queue` | 124 | 一次性/周期性定时器、惰性取消、回调内重入、到期顺序 | 无 |
+| `test_dispatcher` | 111 | 路由注册与冲突、未知 method_id、截断 payload、错误码透传、deadline 判定 | 无 |
 | `test_e2e_echo` | 38 | **进程内真实 Server + Channel 往返**：并发不串号、超时与迟到响应、错误码透传、300 KiB 载荷 | 无（端口用 0） |
 | `codegen_python` | 180 | 生成器：AST、语义校验、golden 输出、method_id 一致性 | 无（标准库 `unittest`） |
 | `interop_protobuf` | 3 | 本框架编出的字节能被**官方 protobuf** 解析（13 字段逐值比对） | `protoc` + `google.protobuf`，缺任一个自动 `***Skipped`（退出码 2） |
+
+合计：**C++ 9,995 条断言**（11 个可执行）+ 生成器 180 + 互通 3。断言数不是多多益善——
+`test_load_balancer` 那 7,460 条里绝大部分来自"200 次循环各断言一次"这类分布检查，
+它们存在的意义是让"偶发偏差"变成必现失败，而不是凑数。
 
 `interop_protobuf` 是唯一可能被跳过的用例，跳过时 ctest 会把它列进 `The following tests were not run`，
 **不要**把 `***Skipped` 读成通过——这也是它用退出码 2 + `SKIP_RETURN_CODE` 而不是直接返回 0 的原因。

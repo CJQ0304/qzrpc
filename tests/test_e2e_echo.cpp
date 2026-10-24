@@ -598,11 +598,28 @@ void TestCallAfterStopFailsFast() {
 }  // namespace
 
 int main() {
+  // 每个用例开跑前打一行并 flush。
+  //
+  // 为什么值得占这几行：进程内起真实 Server/Channel 的用例，**卡住**是一种真实的失败形态
+  // （等一个永远不来的响应、join 一个不退出的 io 线程）。没有这行输出时，"ctest 超时"
+  // 只告诉你"这个文件挂了"，不告诉你是哪一条；有了它，卡住时最后一行就是凶手。
+  // 成功路径上 ctest 不展示 stdout，所以不留噪音。
+  auto announce = [](const char* name) {
+    std::printf("== %s\n", name);
+    std::fflush(stdout);
+  };
+
+  announce("TestSingleCallRoundTrip");
   TestSingleCallRoundTrip();
+  announce("TestConcurrentCallsDoNotCross");
   TestConcurrentCallsDoNotCross();
+  announce("TestTimeoutThenLateResponseIsDiscarded");
   TestTimeoutThenLateResponseIsDiscarded();
+  announce("TestServerErrorPassthroughIsNotRetried");
   TestServerErrorPassthroughIsNotRetried();
+  announce("TestLargeAndBinaryPayload");
   TestLargeAndBinaryPayload();
+  announce("TestCallAfterStopFailsFast");
   TestCallAfterStopFailsFast();
   return qztest::Summary("test_e2e_echo");
 }
