@@ -695,7 +695,7 @@ try {
     Write-Bad 'echo_client did not print "[client] retry_total=.. failover_total=.." (cannot verify the claim)'
   } elseif (($failoverRun.ExitCode -eq 0) -and ($failoverServed -eq 20) -and ($retryTotal -eq 0) -and ($failoverTotal -ge 1)) {
     $failoverOk = $true
-    Write-Ok ("20/20 served by A with retry_total=0, failover_total={0} (switches, not retries)" -f $failoverTotal)
+    Write-Ok ("20/20 served by A with retry_total=0, failover_total={0} (switches, not retries); A request_total +{1}" -f $failoverTotal, $failoverServed)
   } elseif ($failoverServed -ne 20) {
     Write-Bad ("A counted {0} of the 20 calls -- either B was not really dead or calls were lost" -f $failoverServed)
   } elseif (($retryTotal -ne 0) -or ($failoverTotal -lt 1)) {

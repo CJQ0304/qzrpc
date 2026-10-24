@@ -242,7 +242,7 @@ SMOKE OK calls=50 ok=50 fail=0 instances=1 ms=860.3
       端口         次数   占比
       16161              20   100.0%
     [client] retry_total=0 failover_total=19
-    OK   20/20 served by A with retry_total=0, failover_total=19 (switches, not retries)
+    OK   20/20 served by A with retry_total=0, failover_total=19 (switches, not retries); A request_total +20
     restarting B so the next step (and -KeepRunning) leaves a healthy pair
 ```
 
@@ -352,12 +352,18 @@ build\example\echo_client.exe --servers 127.0.0.1:16161,127.0.0.1:16162 --loop 2
 1. **让第一手错误可见**。带默认的 2 次重试时，同样的命令第一行报的是
    `ServiceUnavailable: ... endpoint in cooldown`——真实原因（`connect timeout`）被重试盖掉了，
    冷却反而成了结论。失败诊断里，"最终报错"经常不是"真实原因"，这是同一类问题。
-2. **让"重试换来了什么"这件事被看见**。同样的 20 次、同样的全死，成功率都是 0/20，
+2. **让"重试换来了什么"这件事被看见**。同样的 20 次、同样的全死，**成功次数都是 0**（20 次全失败），
    但耗时是 **408ms（retries=0）vs 1963ms（retries=2）**。重试在这里没换来任何一次成功，
-   只换来了 5 倍等待。这也正是 `max_retries` 必须显式给出的理由：**它会改变你观测到的现象。**
+   只换来了约 5 倍等待。这也正是 `max_retries` 必须显式给出的理由：**它会改变你观测到的现象。**
 
 > ⚠️ 如果这一屏第一次也是秒回（没有 200ms 那一下），说明屏 A 留下的冷却（3 秒）还没到期。
 > 别慌，这恰好是加分的说法："冷却还在生效，所以连第一次尝试都省了。"
+
+> **别和 §2 的 Step 8 混，两屏证明的是相反的东西**：
+> 屏 A / Step 8 是**杀一个实例 → 20/20 成功**（走故障转移，换到活着的那个）；
+> 屏 B 是**全杀 → 20/20 失败**（没有候选可换，走冷却快速失败）。
+> 一个证明"能换"，一个证明"换不了就别拖"。拿屏 B 的失败数据去证 Step 8 的成功结论，
+> 是这组演示里最容易被一句话打穿的地方。
 
 ### 屏 C（约 25 秒）：浏览器里看指标
 
