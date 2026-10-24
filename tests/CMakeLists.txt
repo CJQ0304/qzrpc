@@ -19,6 +19,7 @@ set(QZRPC_TEST_SOURCES
   test_frame_metadata.cpp
   test_service_registry.cpp
   test_dispatcher.cpp
+  test_event_loop.cpp
   test_e2e_echo.cpp
 )
 
