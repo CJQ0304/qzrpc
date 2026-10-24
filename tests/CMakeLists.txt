@@ -48,8 +48,17 @@ foreach(test_source IN LISTS QZRPC_TEST_SOURCES)
   endif()
 
   add_test(NAME ${test_name} COMMAND ${test_name})
-  # 单测不应出现"偶发挂住"，超过 60s 一律视为失败。
-  set_tests_properties(${test_name} PROPERTIES TIMEOUT 60)
+  # 超时是**误报判据**，不是性能判据 —— 180s 这个数是这样来的：
+  #   * 全部用例正常跑完是 0.9s..4.2s 量级；
+  #   * 但这台机器上存在一个与代码无关的首次执行延迟：**刚链接出来/刚被写入的二进制，
+  #     第一次执行会被主机实时杀软拦下来扫描**。实测把一个 exe 拷成新名字立刻跑，
+  #     >70s 且**零输出**（连 main 都没进），同一文件一分钟后再跑 0.9s PASS。
+  #     而"链接完成 → ctest 启动"只隔几秒，正好撞上，这恰恰是全新目录 CI 的常态路径。
+  # 所以 60s 会**在最健康的那条路径上误报**，而 180s 不会漏掉任何诊断信息：
+  # 每个用例进 main 先打印 `== TestXxx` 并 flush，真挂住时最后一行就是凶手。
+  # 遇到"偶发超时 / 零输出"的排查顺序**先环境后代码**：单独跑一次 + 立刻重跑一次，
+  # 两次都正常就是杀软扫描，不是回归。
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 180)
 endforeach()
 
 # ---------------------------------------------------------------------------

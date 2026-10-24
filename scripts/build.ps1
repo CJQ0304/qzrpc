@@ -96,6 +96,14 @@ if ($Clean) {
 
 # ---------------------------------------------------------------------------
 # 3. Configure
+#
+# ALWAYS configure, even when the build directory already exists and only `build` was
+# asked for. `cmake --build` alone is not enough to keep a build honest: tests\
+# CMakeLists.txt skips a source it cannot find (`if (NOT EXISTS ...)`), so a configure
+# that happened while a test file was still being written bakes that skip in. Ninja does
+# not re-run configure afterwards (no CMakeLists.txt mtime change), and ctest then prints
+# "100% tests passed, 0 tests failed out of 9" while 4 cases are simply not there.
+# Step 5 below verifies the COUNT for exactly this reason -- see the guard there.
 # ---------------------------------------------------------------------------
 Write-Step "Configuring ($Config) -> $buildPath"
 $configureArgs = @(
@@ -129,6 +137,38 @@ $stopwatch.Stop()
 # 5. Test
 # ---------------------------------------------------------------------------
 if (-not $NoTest) {
+  # -------------------------------------------------------------------------
+  # Guard: every tests\test_*.cpp on disk must be a registered ctest case.
+  #
+  # This is not a hypothetical. A configure that ran while a test file was still
+  # being written skips it (tests\CMakeLists.txt: `if (NOT EXISTS ...) continue()`),
+  # and `cmake --build` will never re-run configure afterwards. The result is a
+  # perfectly green run that is missing cases:
+  #   100% tests passed, 0 tests failed out of 9     <- 4 cases / 8035 assertions gone
+  # Nothing errors, nothing warns, and it reads healthier than the real thing. So the
+  # count is verified instead of the verdict being trusted -- "all green" must also
+  # mean "all present".
+  # -------------------------------------------------------------------------
+  $testListing = & ctest --test-dir $buildPath -C $Config -N
+  if ($LASTEXITCODE -ne 0) { Stop-WithError "ctest -N failed (exit code $LASTEXITCODE)" }
+  $registeredCpp = @()
+  foreach ($line in $testListing) {
+    $nameMatch = [regex]::Match($line, '^\s*Test\s+#\d+:\s+(\S+)')
+    # codegen_python / interop_protobuf come from other CMakeLists and have no
+    # tests\test_*.cpp behind them, so only test_* names are compared here.
+    if ($nameMatch.Success -and $nameMatch.Groups[1].Value -like 'test_*') {
+      $registeredCpp += $nameMatch.Groups[1].Value
+    }
+  }
+  $sourcesOnDisk = @(Get-ChildItem -LiteralPath (Join-Path $rootDir 'tests') -Filter 'test_*.cpp' -File)
+  $missingTests = @($sourcesOnDisk | Where-Object { $registeredCpp -notcontains $_.BaseName })
+  if ($missingTests.Count -gt 0) {
+    $names = ($missingTests | ForEach-Object { $_.Name }) -join ', '
+    Stop-WithError ("test source(s) exist but are not registered with ctest: {0} (a stale configure skips files that did not exist when it ran; delete the build dir or fix tests\CMakeLists.txt)" -f $names)
+  }
+  Write-Host ("    ctest knows {0} C++ case(s), tests\ has {1} test_*.cpp" -f `
+    $registeredCpp.Count, $sourcesOnDisk.Count)
+
   Write-Step "Running ctest"
   & ctest --test-dir $buildPath -C $Config --output-on-failure
   if ($LASTEXITCODE -ne 0) {

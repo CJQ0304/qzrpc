@@ -20,20 +20,34 @@
   Also writes the machine profile into the output: a QPS number without the CPU model
   and core count is not reproducible, so it is not evidence.
 
-  READ THIS BEFORE QUOTING THE NUMBERS -- what this sweep does NOT measure:
-    example\echo_client.cpp sets `connections_per_endpoint = 1` (single endpoint, and also
-    the multi-endpoint demo path). So every client thread shares ONE connection per
-    server, and request/response on that connection is one-at-a-time. The sweep therefore
-    measures `one connection round-trip throughput`, NOT server capacity: adding threads
-    only adds queueing (measured: 1 thread 14.9k QPS / p50 54us vs 4 threads 13.4k QPS /
-    p50 235us -- flat-to-worse, exactly what a single serialized connection predicts).
-    To measure the server you need either -Connections (a flag that does not exist yet on
-    echo_client) or N servers x 1 connection each. Until then, treat this table as a
-    per-connection latency/throughput baseline and say so wherever it is quoted.
+  READ THIS BEFORE QUOTING THE NUMBERS -- what a row means:
+    Every row is labelled with BOTH knobs: `threads` and `conns` (connections per endpoint).
+    A QPS table without the conns column is a WRONG table, and this was measured, not argued:
+    same binary, same server, same moment --
+      --conns 1  -> qps 24108  p50 230us  p99 1339us
+      --conns 8  -> qps 43104  p50 157us  p99  277us   (1.79x)
+    One connection serialises request/response, so with `-Conns 1` the sweep measures
+    `one connection round-trip throughput`, NOT server capacity. With `-Conns 8+` it starts
+    to measure the server. Both are legitimate; they answer different questions.
+
+    `--conns` is always passed EXPLICITLY here, never left to echo_client's auto rule
+    (`max(8,threads)` for --bench). Reason: an implicit default makes two releases
+    incomparable without anyone noticing -- the old script recorded a table whose every
+    row was silently 1 connection, and it looked exactly like a capacity table.
+
+    The client prints where the value came from; this script parses that line and FAILS
+    the round if it does not say `source=cli(--conns N)`. "The parameter looks like it was
+    passed in" is not evidence -- `-Threads 1,4` arriving as the single value 14 is.
+
+  Also writes the machine profile into the output: a QPS number without the CPU model
+  and core count is not reproducible, so it is not evidence. On a hybrid CPU (P-cores with
+  SMT + E-cores without) the thread axis has TWO regimes, and a table that sweeps 1..32
+  hides the seam instead of showing it -- see -Threads.
 
   Usage:
     powershell -ExecutionPolicy Bypass -File scripts\bench.ps1
-    powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -Threads 1,2,4,8,16 -Requests 5000 -Rounds 5
+    powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -Threads 8,16,24 -Conns 1,2,4,8,16 -Requests 5000 -Rounds 5
+    powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -Conns 1 -SkipBuild        (single-conn baseline)
     powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -SkipBuild -Output bench.md
 
   Exit code: 0 = every round ran and parsed, 1 = a round failed or its output did not parse.
@@ -47,14 +61,34 @@ param(
   # 0 disables the built-in /metrics endpoint (the server then logs no metrics).
   [int]    $MetricsPort = 9101,
 
-  # Comma-separated thread counts, e.g. "1,2,4,8".
+  # Comma-separated client thread counts, e.g. "8,16,24".
   #
   # Taken as a STRING and split by hand, for a measured reason: `-Threads 1,4` passed
   # through `powershell -File script.ps1 -Threads 1,4` arrives as ONE argument whose text
   # is "1,4", and casting that to [int[]] does not split it -- it produced a single
   # element 14 (the comma silently swallowed), so the sweep ran a bogus 14-thread point.
   # Parsing the string here makes the CLI behave the way it reads.
-  [string] $Threads     = '1,2,4,8',
+  #
+  # Default 8,16,24 is chosen for THIS class of machine, not for aesthetics. A hybrid CPU
+  # (this host: i9-14900HX = 8 P-cores with SMT = 16 threads, plus 16 E-cores without SMT
+  # = 16 more) has two regimes separated by the P-core thread count:
+  #   * threads <= 16 : every worker can live on a P-core; the curve is the framework's
+  #                     scalability;
+  #   * threads >  16 : new workers land on E-cores, roughly half the single-core
+  #                     throughput and no SMT sibling.
+  # So 24 is here as ONE "oversubscription cost" probe, not as a point on a curve.
+  # Sweeping 1..32 produces an ARCHITECTURE cost curve and prints it as if it were a
+  # FRAMEWORK scalability curve -- those are two different claims and must not share a table.
+  [string] $Threads     = '8,16,24',
+
+  # Comma-separated connections PER ENDPOINT, e.g. "1,2,4,8,16".
+  #
+  # This axis is the one that was missing for the whole first round of measurement, and
+  # without it the previous table was mislabelled rather than merely imprecise.
+  # Measured on this host (single endpoint, 2000 req/thread): 1 -> 24.1k QPS, 8 -> 43.1k
+  # (+79%), p99 1339us -> 277us. The knee is around conns == thread count; past that it is
+  # flat, so 1,2,4,8,16 is enough to show the shape.
+  [string] $Conns       = '1,2,4,8,16',
 
   # Requests PER THREAD per round (that is how echo_client --bench N T defines N).
   [int]    $Requests    = 2000,
@@ -91,25 +125,29 @@ function Stop-WithError([string] $message) {
   exit 1
 }
 
-# "1,2,4,8" -> @(1,2,4,8). Rejects empty items and non-positive values early: a 0-thread
+# "1,2,4,8" -> @(1,2,4,8). Rejects empty items and out-of-range values early: a 0-thread
 # point would make echo_client fall back to its own default and quietly measure the wrong
-# thing.
-function ConvertTo-ThreadList([string] $text) {
+# thing, which is the exact failure class this script is built to avoid.
+function ConvertTo-IntList([string] $text, [int] $maxValue, [string] $label) {
   $list = @()
   foreach ($part in ($text -split ',')) {
     $trimmed = $part.Trim()
     if ($trimmed -eq '') { continue }
     $value = 0
-    if (-not [int]::TryParse($trimmed, [ref]$value) -or $value -le 0 -or $value -gt 256) {
-      Stop-WithError ("invalid thread count '{0}' (expect 1..256 in a comma-separated list)" -f $trimmed)
+    if (-not [int]::TryParse($trimmed, [ref]$value) -or $value -le 0 -or $value -gt $maxValue) {
+      Stop-WithError ("invalid {0} '{1}' (expect 1..{2} in a comma-separated list)" -f `
+        $label, $trimmed, $maxValue)
     }
     $list += $value
   }
-  if ($list.Count -eq 0) { Stop-WithError 'no thread count given (-Threads 1,2,4,8)' }
+  if ($list.Count -eq 0) { Stop-WithError ("no {0} given (-{1})" -f $label, $label) }
   return $list
 }
 
-$threadList = ConvertTo-ThreadList $Threads
+$threadList = ConvertTo-IntList $Threads 256 'threads'
+# echo_client rejects --conns outside 1..1024 (exit code 2); catch it here so a typo does
+# not turn into a half-finished sweep with a few good rows and one dead point.
+$connsList  = ConvertTo-IntList $Conns 1024 'conns'
 
 # ---------------------------------------------------------------------------
 # 0. Toolchain
@@ -139,7 +177,7 @@ foreach ($exe in @($serverExe, $clientExe)) {
 }
 
 # ---------------------------------------------------------------------------
-# Helpers (same shape as scripts\run_demo.ps1 -- see the comments there)
+# Helpers (same shape as scripts\demo.ps1 -- see the comments there)
 #
 # Start-Process is avoided on purpose: it rebuilds the child environment in a
 # case-INSENSITIVE dictionary and throws "an item with the same key has already been
@@ -226,6 +264,22 @@ function Get-Median([double[]] $values) {
   return ($sorted[$middle - 1] + $sorted[$middle]) / 2.0
 }
 
+# echo_client announces where every auto-derivable knob came from, e.g.
+#   [client] connections_per_endpoint=8 source=cli(--conns 8) endpoints=1 total_conns=8
+# `source=` may itself contain parentheses and spaces (`auto(bench threads=8 -> max(8,threads))`),
+# so the capture is non-greedy up to the `endpoints=` marker rather than `\S+`.
+function Get-ClientConnsSource([string] $text) {
+  $match = [regex]::Match($text,
+    'connections_per_endpoint=(\d+)\s+source=(.+?)\s+endpoints=(\d+)\s+total_conns=(\d+)')
+  if (-not $match.Success) { return $null }
+  return New-Object psobject -Property @{
+    Conns     = [int]$match.Groups[1].Value
+    Source    = $match.Groups[2].Value.Trim()
+    Endpoints = [int]$match.Groups[3].Value
+    Total     = [int]$match.Groups[4].Value
+  }
+}
+
 # ---------------------------------------------------------------------------
 # 1. Start the server
 # ---------------------------------------------------------------------------
@@ -256,65 +310,106 @@ try {
   # -------------------------------------------------------------------------
   # 2. Warmup (discarded)
   # -------------------------------------------------------------------------
+  # Warmup uses the WIDEST conns point, so every server-side connection the sweep will
+  # later use is already created and page-faulted in. It is discarded -- but its
+  # announcement line is still checked: if `--conns` were being ignored, this is the
+  # cheapest possible place to find out, before 15 points x N rounds have been recorded
+  # under a label that is not true.
+  $warmConns = [int]($connsList | Measure-Object -Maximum).Maximum
   if ($Warmup -gt 0) {
-    Write-Step ("Warmup: {0} requests" -f $Warmup)
+    Write-Step ("Warmup: {0} requests, threads=1, conns={1}" -f $Warmup, $warmConns)
     $warm = Invoke-ClientCaptured @('--servers', ("127.0.0.1:{0}" -f $Port),
-                                    '--bench', "$Warmup", '1')
+                                    '--bench', "$Warmup", '1',
+                                    '--conns', "$warmConns")
     if ($warm.ExitCode -ne 0) {
+      Write-Host $warm.Stdout.TrimEnd()
       Write-Host $warm.Stderr.TrimEnd()
       Stop-WithError ("warmup failed with exit code {0}" -f $warm.ExitCode)
+    }
+    $warmSource = Get-ClientConnsSource $warm.Stdout
+    if ($null -eq $warmSource) {
+      Write-Host $warm.Stdout.TrimEnd()
+      Stop-WithError 'warmup printed no [client] connections_per_endpoint line, so --conns cannot be verified'
+    }
+    if ($warmSource.Conns -ne $warmConns -or $warmSource.Source -notlike 'cli(*') {
+      Stop-WithError ("warmup asked for conns={0} but the client reports conns={1} source={2} -- the flag did not take effect" -f `
+        $warmConns, $warmSource.Conns, $warmSource.Source)
     }
   }
 
   # -------------------------------------------------------------------------
-  # 3. Sweep
+  # 3. Sweep: threads x conns
   # -------------------------------------------------------------------------
   foreach ($threadCount in $threadList) {
-    $qpsValues = @()
-    $p50Values = @()
-    $p99Values = @()
-    $maxValues = @()
-    $totalErrors = 0
-    $totalRequests = 0
+    foreach ($connCount in $connsList) {
+      $qpsValues = @()
+      $p50Values = @()
+      $p99Values = @()
+      $maxValues = @()
+      $totalErrors = 0
+      $totalRequests = 0
+      $connSource = ''
 
-    for ($round = 1; $round -le $Rounds; $round++) {
-      $run = Invoke-ClientCaptured @('--servers', ("127.0.0.1:{0}" -f $Port),
-                                      '--bench', "$Requests", "$threadCount")
-      if ($run.ExitCode -ne 0) {
-        Write-Host $run.Stdout.TrimEnd()
-        Write-Host $run.Stderr.TrimEnd()
-        $failed++
-        break
+      for ($round = 1; $round -le $Rounds; $round++) {
+        $run = Invoke-ClientCaptured @('--servers', ("127.0.0.1:{0}" -f $Port),
+                                        '--bench', "$Requests", "$threadCount",
+                                        '--conns', "$connCount")
+        if ($run.ExitCode -ne 0) {
+          Write-Host $run.Stdout.TrimEnd()
+          Write-Host $run.Stderr.TrimEnd()
+          $failed++
+          break
+        }
+        $metrics = Get-BenchMetrics $run.Stdout
+        if ($null -eq $metrics.Qps) {
+          Write-Host $run.Stdout.TrimEnd()
+          Write-Host '    (could not parse the bench output)'
+          $failed++
+          break
+        }
+        # The row label has to be TRUE, not intended. The client states which source the
+        # value came from; a row whose actual conns differ from the column it would be
+        # printed under is a mislabelled measurement, and a mislabelled number is worse
+        # than a missing one.
+        $connsInfo = Get-ClientConnsSource $run.Stdout
+        if ($null -eq $connsInfo) {
+          Write-Host $run.Stdout.TrimEnd()
+          Write-Host '    (no [client] connections_per_endpoint line -- cannot verify --conns)'
+          $failed++
+          break
+        }
+        if ($connsInfo.Conns -ne $connCount -or $connsInfo.Source -notlike 'cli(*') {
+          Write-Host ("    asked conns={0}, client used conns={1} source={2}" -f `
+            $connCount, $connsInfo.Conns, $connsInfo.Source)
+          $failed++
+          break
+        }
+        $connSource = $connsInfo.Source
+        Write-Host ("    threads={0} conns={1} round={2}/{3}  qps={4:N1}  p50={5}us  p99={6}us  errors={7}" -f `
+          $threadCount, $connCount, $round, $Rounds, $metrics.Qps, $metrics.P50, $metrics.P99, $metrics.Errors)
+        $qpsValues += $metrics.Qps
+        if ($null -ne $metrics.P50) { $p50Values += [double]$metrics.P50 }
+        if ($null -ne $metrics.P99) { $p99Values += [double]$metrics.P99 }
+        if ($null -ne $metrics.Max) { $maxValues += [double]$metrics.Max }
+        $totalErrors += $metrics.Errors
+        $totalRequests += $metrics.Requests
       }
-      $metrics = Get-BenchMetrics $run.Stdout
-      if ($null -eq $metrics.Qps) {
-        Write-Host $run.Stdout.TrimEnd()
-        Write-Host '    (could not parse the bench output)'
-        $failed++
-        break
-      }
-      Write-Host ("    threads={0} round={1}/{2}  qps={3:N1}  p50={4}us  p99={5}us  errors={6}" -f `
-        $threadCount, $round, $Rounds, $metrics.Qps, $metrics.P50, $metrics.P99, $metrics.Errors)
-      $qpsValues += $metrics.Qps
-      if ($null -ne $metrics.P50) { $p50Values += [double]$metrics.P50 }
-      if ($null -ne $metrics.P99) { $p99Values += [double]$metrics.P99 }
-      if ($null -ne $metrics.Max) { $maxValues += [double]$metrics.Max }
-      $totalErrors += $metrics.Errors
-      $totalRequests += $metrics.Requests
-    }
 
-    if ($qpsValues.Count -gt 0) {
-      [void]$rows.Add((New-Object psobject -Property @{
-        Threads  = $threadCount
-        QpsMed   = (Get-Median $qpsValues)
-        QpsMin   = ($qpsValues | Measure-Object -Minimum).Minimum
-        QpsMax   = ($qpsValues | Measure-Object -Maximum).Maximum
-        P50      = (Get-Median $p50Values)
-        P99      = (Get-Median $p99Values)
-        Max      = (Get-Median $maxValues)
-        Requests = $totalRequests
-        Errors   = $totalErrors
-      }))
+      if ($qpsValues.Count -gt 0) {
+        [void]$rows.Add((New-Object psobject -Property @{
+          Threads  = $threadCount
+          Conns    = $connCount
+          Source   = $connSource
+          QpsMed   = (Get-Median $qpsValues)
+          QpsMin   = ($qpsValues | Measure-Object -Minimum).Minimum
+          QpsMax   = ($qpsValues | Measure-Object -Maximum).Maximum
+          P50      = (Get-Median $p50Values)
+          P99      = (Get-Median $p99Values)
+          Max      = (Get-Median $maxValues)
+          Requests = $totalRequests
+          Errors   = $totalErrors
+        }))
+      }
     }
   }
 } finally {
@@ -416,25 +511,33 @@ $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 # two minutes apart gave 19.2k and 4.7k QPS at 1 thread because other builds were running.
 # So the spread is printed per row, and a point whose (max-min)/median exceeds 30% is
 # flagged: those numbers are for "is it roughly this order of magnitude", not for a table.
+#
+# The conns column is not decoration. Every row states the two knobs it was measured with,
+# because a QPS number whose connection count is unknown is not a measurement -- the same
+# binary measured 24.1k and 43.1k in the same minute purely by changing conns.
 $noisy = New-Object System.Collections.ArrayList
 $lines = New-Object System.Collections.ArrayList
-[void]$lines.Add('| threads | QPS (median) | QPS (min..max) | spread | p50 (us) | p99 (us) | max (us) | requests | errors |')
-[void]$lines.Add('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
+[void]$lines.Add('| threads | conns | QPS (median) | QPS (min..max) | spread | p50 (us) | p99 (us) | max (us) | requests | errors |')
+[void]$lines.Add('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
 foreach ($row in $rows) {
   $spread = 0.0
   if ($row.QpsMed -gt 0) { $spread = ($row.QpsMax - $row.QpsMin) / $row.QpsMed }
   $spreadText = ('{0:N0}%' -f ($spread * 100))
-  if ($spread -gt 0.30) { [void]$noisy.Add($row.Threads) }
-  [void]$lines.Add(("| {0} | {1:N0} | {2:N0}..{3:N0} | {4} | {5:N0} | {6:N0} | {7:N0} | {8} | {9} |" -f `
-    $row.Threads, $row.QpsMed, $row.QpsMin, $row.QpsMax, $spreadText, $row.P50, $row.P99, `
-    $row.Max, $row.Requests, $row.Errors))
+  if ($spread -gt 0.30) { [void]$noisy.Add(("threads={0}/conns={1}" -f $row.Threads, $row.Conns)) }
+  [void]$lines.Add(("| {0} | {1} | {2:N0} | {3:N0}..{4:N0} | {5} | {6:N0} | {7:N0} | {8:N0} | {9} | {10} |" -f `
+    $row.Threads, $row.Conns, $row.QpsMed, $row.QpsMin, $row.QpsMax, $spreadText, `
+    $row.P50, $row.P99, $row.Max, $row.Requests, $row.Errors))
 }
 
 Write-Host ''
-Write-Host ($lines -join "`n")
+# One Write-Host per line. Not for correctness -- the authoritative output is the Markdown
+# file written below -- but because a multi-line string in a single Write-Host renders its
+# last line glued to the next print in some capture setups, and a table that only LOOKS
+# right in one terminal is the same class of problem this script exists to avoid.
+foreach ($tableLine in $lines) { Write-Host $tableLine }
+Write-Host ''
 if ($noisy.Count -gt 0) {
-  Write-Host ''
-  Write-Host ("    !! noisy: thread point(s) {0} spread more than 30% between rounds." -f `
+  Write-Host ("    !! noisy: point(s) {0} spread more than 30% between rounds." -f `
     ($noisy -join ', ')) -ForegroundColor Yellow
   Write-Host  "       Do NOT quote those rows: repeat the run on an idle machine first."
 }
@@ -446,8 +549,18 @@ Write-Host ("    os      : {0} {1}" -f $machine.OsCaption, $machine.OsVersion)
 Write-Host ("    source  : {0}" -f $machine.Source)
 Write-Host ("    topology: echo_server and echo_client are two processes on THIS host,")
 Write-Host  "              talking over loopback (127.0.0.1) - no network in between."
+Write-Host ("    axis    : threads={0} x conns/endpoint={1} (conns is ALWAYS explicit)" -f `
+  ($threadList -join ','), ($connsList -join ','))
 Write-Host ("    params  : requests/thread={0}, rounds={1} (median reported), warmup={2}" -f `
   $Requests, $Rounds, $Warmup)
+if ($machine.Logical -gt $machine.Cores) {
+  # A hybrid part shows up as logical > cores; which cores are P and which are E is a
+  # model-specific fact the script cannot read, so it states the consequence instead of
+  # guessing the split.
+  Write-Host  "              hybrid CPU likely (logical > physical): past the P-core thread count,"
+  Write-Host  "              new workers run on E-cores (approx. half the per-core throughput)."
+  Write-Host  "              Treat threads > P-core-threads points as an oversubscription COST probe."
+}
 
 $document = @()
 $document += '# qzrpc benchmark'
@@ -458,17 +571,20 @@ $document += ("- cores: {0} physical / {1} logical" -f $machine.Cores, $machine.
 $document += ("- memory: {0} GB" -f $machine.MemoryGb)
 $document += ("- os: {0} {1}" -f $machine.OsCaption, $machine.OsVersion)
 $document += ("- profile source: {0}" -f $machine.Source)
+$document += ("- axis: threads={0} x conns/endpoint={1}" -f ($threadList -join ','), ($connsList -join ','))
 $document += ("- params: requests/thread={0}, rounds={1} (median reported), warmup={2}" -f `
   $Requests, $Rounds, $Warmup)
 $document += '- topology: client and server are two processes on the same host, over loopback.'
-$document += '- connection: echo_client uses connections_per_endpoint=1, so all client'
-$document += '  threads share ONE connection per server -> this table measures one-connection'
-$document += '  round-trip throughput, NOT server capacity.'
+$document += '- connection: --conns is passed explicitly for every point and the client'
+$document += '  announcement line is verified (`source=cli(--conns N)`); a row whose actual'
+$document += '  conns differ from its label fails the run instead of being recorded.'
+$document += '- reading: rows with conns=1 measure ONE connection round-trip throughput, not'
+$document += '  server capacity. Rows with conns>=threads are where the server is the subject.'
 $document += '- NOTE: loopback numbers are for RELATIVE comparison between revisions,'
 $document += '  not an estimate of cross-network performance.'
 if ($noisy.Count -gt 0) {
   $document += ''
-  $document += ('- WARNING: thread point(s) {0} varied more than 30% between rounds;' -f ($noisy -join ', '))
+  $document += ('- WARNING: point(s) {0} varied more than 30% between rounds;' -f ($noisy -join ', '))
   $document += '  the machine was busy. Re-run on an idle machine before quoting these rows.'
 }
 $document += ''
@@ -483,5 +599,6 @@ if ($failed -gt 0) {
   exit 1
 }
 Write-Host ''
-Write-Host ("BENCH OK: {0} thread point(s) x {1} round(s)" -f $rows.Count, $Rounds) -ForegroundColor Green
+Write-Host ("BENCH OK: {0} point(s) ({1} threads x {2} conns) x {3} round(s)" -f `
+  $rows.Count, $threadList.Count, $connsList.Count, $Rounds) -ForegroundColor Green
 exit 0

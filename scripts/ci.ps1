@@ -29,6 +29,23 @@
   the IDL / generator / committed-artifact gates are still fully checkable -- those
   three gates are exactly what a codegen-side change needs to be validated against.
 
+  Stage 1 always runs a full `cmake -S -B` configure before the build (scripts\build.ps1
+  step 3). That is deliberate and must stay: `cmake --build` on an existing build tree does
+  NOT pick up a newly added test file, because tests\CMakeLists.txt skips sources it cannot
+  find at configure time and ninja sees no dependency change afterwards. A "100% tests
+  passed, 0 tests failed out of 9" was seen exactly that way while 4 cases were missing.
+  build.ps1 now also cross-checks tests\test_*.cpp against `ctest -N` and fails on a gap.
+
+  TRIAGE ORDER for "flaky timeout" / "test hangs with zero output" -- ENVIRONMENT FIRST,
+  CODE SECOND:
+    1. run the failing .exe directly, then immediately run it again;
+    2. if both pass, it was the first-execution antivirus scan (measured on this host:
+       a freshly linked or freshly copied exe took >70s and printed nothing at all --
+       not even main() -- then 0.9s once the scanner had seen it);
+    3. only after that, suspect a regression.
+  ctest TIMEOUT is 180s for this reason. A guard that trips on the healthy path (fresh
+  build directory -> ctest, which is what CI does every day) is noise, not a guard.
+
   OFFLINE: every stage runs with no network access. The toolchain is already on disk
   (msvc_env.cmd), the generator is local Python, and the only optional external tool
   (protoc, used by the interop_protobuf ctest case) self-skips with exit code 2 when it
