@@ -1,0 +1,54 @@
+# 构建产物
+build/
+# 任意 build 目录变体：build_lead / build_probe / build_qt 这类临时构建目录
+# （多人并行时每人一个，绝不能进仓库）
+build-*/
+build_*/
+out/
+.scratch/
+.tmp_probe/
+
+# 上游参考实现（phxrpc 原项目的一份只读拷贝，用来对照 API 与语义）。
+# 不进仓库：它是别人的代码、别人的 LICENSE，混进本项目会让人分不清哪部分是谁写的。
+# 需要时自行 `git clone` 上游到同名目录即可，本仓库任何构建都不依赖它。
+_ref_phxrpc/
+
+# ★ 不要往下面加 generated/ 或 *.qz.h / *.qz.cpp ★
+# generated/ 是 codegen 的 golden 基准：CI 的 test_golden 与 interop 用例直接读它，
+# 评审者靠它比对生成器输出。它必须随仓库一起提供（见 README「生成代码」一节）。
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeUserPresets.json
+compile_commands.json
+
+# MSVC / Visual Studio
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.dll
+.vs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# 协作工具的运行期状态（不是工程的任何一部分）
+.workbuddy/
+
+# 运行时产物
+*.log
+*.conf.local

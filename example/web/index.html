@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>轻舟 RPC · 服务端指标</title>
+<!--
+  单文件、原生 JS、零 CDN 依赖 —— 与框架本身"零第三方"的取舍保持一致。
+  打开方式：直接双击本文件（服务端 /metrics 已带 Access-Control-Allow-Origin: *），
+  或由任意静态服务器托管。
+
+  边界说明（重要，别在演示时被问穿）：
+    浏览器**不能**直接发 qzrpc 的二进制帧：QZRP 是一个 20 字节定长大端帧头的
+    二进制协议，且浏览器无法在 JS 里构造任意二进制帧后按需要复用 TCP 长连接
+    （WebSocket 不是裸 TCP）。所以本页面**只消费 /metrics 文本**，
+    Echo 的往返演示走命令行 `echo_client --once`。
+    如果哪天要网页直连，正确做法是加一个 HTTP/JSON 网关（把 HTTP 请求翻译成
+    一次 qzrpc Call），而不是在浏览器里手搓帧。
+-->
+<style>
+  :root {
+    --bg: #0f1216;
+    --panel: #161b22;
+    --panel-2: #1c2230;
+    --line: #262d3a;
+    --text: #d7dee8;
+    --muted: #7d8798;
+    --ok: #38d39f;
+    --warn: #f0b429;
+    --bad: #f2555a;
+    --accent: #4f9cf9;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; letter-spacing: .3px; }
+  h1 .sub { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+
+  /* ---- 工具条 ---- */
+  .bar {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 14px; margin: 14px 0 18px;
+  }
+  .bar label { color: var(--muted); font-size: 12px; }
+  .bar input[type="text"] {
+    flex: 1 1 320px; min-width: 220px;
+    background: #0b0e12; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 10px; font-family: var(--mono); font-size: 12px;
+  }
+  .bar input:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: #3a465c; }
+  button.primary { border-color: var(--accent); color: #cfe3ff; }
+  button.on { border-color: var(--ok); color: #b8f3dd; }
+
+  /* ---- 状态灯 ---- */
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--muted); flex: 0 0 auto;
+    box-shadow: 0 0 0 0 rgba(0,0,0,0);
+  }
+  .dot.ok  { background: var(--ok);  box-shadow: 0 0 8px rgba(56,211,159,.7); }
+  .dot.bad { background: var(--bad); box-shadow: 0 0 8px rgba(242,85,90,.7); }
+  .status-text { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+
+  /* ---- KPI 卡片 ---- */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .card .k { color: var(--muted); font-size: 12px; letter-spacing: .4px; }
+  .card .v {
+    font-family: var(--mono); font-size: 26px; font-weight: 600;
+    margin-top: 6px; line-height: 1.15;
+  }
+  .card .u { font-size: 12px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+  .card .note { color: var(--muted); font-size: 11px; margin-top: 4px; }
+
+  /* ---- 图表 ---- */
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  @media (max-width: 880px) { .charts { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 12px 14px 6px;
+  }
+  .panel h2 {
+    margin: 0 0 6px; font-size: 12px; font-weight: 500;
+    color: var(--muted); letter-spacing: .5px;
+  }
+  svg { display: block; width: 100%; height: 130px; }
+  .legend { font-family: var(--mono); font-size: 11px; color: var(--muted); padding-bottom: 6px; }
+
+  /* ---- 表格 ---- */
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-family: var(--mono); font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 11.5px; letter-spacing: .4px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  .dim { color: var(--muted); }
+
+  footer { color: var(--muted); font-size: 12px; margin: 18px 0 4px; line-height: 1.7; }
+  code { font-family: var(--mono); background: #0b0e12; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  .err { color: var(--bad); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>轻舟 RPC · 服务端指标<span class="sub">Qingzhou RPC / builtin metrics</span></h1>
+
+  <div class="bar">
+    <span id="dot" class="dot"></span>
+    <span id="status" class="status-text">尚未采样</span>
+    <label for="url">/metrics</label>
+    <input id="url" type="text" value="http://127.0.0.1:9101/metrics" spellcheck="false">
+    <button id="refresh" class="primary">立即刷新</button>
+    <button id="toggle">暂停自动刷新</button>
+    <span class="status-text" id="interval-text">每 3 秒</span>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="k">QPS</div>
+      <div class="v"><span id="kpi-qps">—</span><span class="u">req/s</span></div>
+      <div class="note">两次采样的请求数差分 ÷ 实际间隔</div>
+    </div>
+    <div class="card">
+      <div class="k">P99 延迟</div>
+      <div class="v"><span id="kpi-p99">—</span><span class="u">ms</span></div>
+      <div class="note">取 <code>..._latency_us_p99</code>；缺失时按 <code>_bucket</code> 估算</div>
+    </div>
+    <div class="card">
+      <div class="k">错误率</div>
+      <div class="v"><span id="kpi-err">—</span><span class="u">%</span></div>
+      <div class="note">窗口内 非 ok 响应 ÷ 请求数</div>
+    </div>
+    <div class="card">
+      <div class="k">活跃连接</div>
+      <div class="v"><span id="kpi-conn">—</span><span class="u">条</span></div>
+      <div class="note">connection_active（Inc/Dec 共用）</div>
+    </div>
+  </div>
+
+  <div class="charts">
+    <div class="panel">
+      <h2>QPS（最近 60 个采样点）</h2>
+      <svg id="chart-qps" viewBox="0 0 600 130" preserveAspectRatio="none">
+        <polyline id="line-qps" fill="none" stroke="#4f9cf9" stroke-width="1.6" points=""></polyline>
+      </svg>
+      <div class="legend"><span id="qps-range">—</span></div>
+    </div>
+    <div class="panel">
+      <h2>延迟 P50 / P99（毫秒）</h2>
+      <svg id="chart-lat" viewBox="0 0 600 130" preserveAspectRatio="none">
+        <polyline id="line-p50" fill="none" stroke="#38d39f" stroke-width="1.6" points=""></polyline>
+        <polyline id="line-p99" fill="none" stroke="#f0b429" stroke-width="1.6" points=""></polyline>
+      </svg>
+      <div class="legend">
+        <span style="color:#38d39f">■</span> P50&nbsp;&nbsp;
+        <span style="color:#f0b429">■</span> P99&nbsp;&nbsp;
+        <span id="lat-range">—</span>
+      </div>
+    </div>
+  </div>
+
+  <table id="counters">
+    <thead>
+      <tr><th>指标</th><th class="num">当前值</th><th class="num">窗口增量</th><th>含义</th></tr>
+    </thead>
+    <tbody>
+      <tr><td colspan="4" class="dim">等待第一次采样…</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    <div>• 本页只读 <code>/metrics</code>，不做 RPC：浏览器发不出 QZRP 二进制帧（20 字节定长大端帧头 + protobuf payload，且需要复用裸 TCP）。Echo 往返演示走 <code>echo_client --once</code>。</div>
+    <div>• 起两个实例看负载均衡：<code>echo_server --port 16161 --metrics-port 9101</code> 与 <code>echo_server --port 16162 --metrics-port 9102</code>，再 <code>echo_client --servers 127.0.0.1:16161,127.0.0.1:16162 --loop 100</code>。</div>
+    <div>• 端口不同就在上面的输入框里换地址；三个实例各自的 metrics_port 见 <code>example/conf/*.conf</code>。</div>
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Prometheus 文本格式解析
+//
+// 只支持框架实际会输出的形状（见 MetricsRegistry::DumpText）：
+//   # HELP/TYPE 注释行
+//   name value
+//   name{label="v",...} value
+// 不认识的行一律跳过 —— 解析器要容忍未来新增指标族，而不是崩掉整个页面。
+// ---------------------------------------------------------------------------
+function parsePrometheus(text) {
+  const samples = [];           // {name, labels, value}
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    const braceAt = line.indexOf("{");
+    let name = line;
+    let labels = "";
+    let valuePart = "";
+    if (braceAt >= 0) {
+      const closeAt = line.indexOf("}", braceAt);
+      if (closeAt < 0) continue;
+      name = line.slice(0, braceAt);
+      labels = line.slice(braceAt + 1, closeAt);
+      valuePart = line.slice(closeAt + 1).trim();
+    } else {
+      const spaceAt = line.lastIndexOf(" ");
+      if (spaceAt < 0) continue;
+      name = line.slice(0, spaceAt);
+      valuePart = line.slice(spaceAt + 1).trim();
+    }
+    const value = Number(valuePart);
+    if (!Number.isFinite(value)) continue;
+    samples.push({ name: name.trim(), labels: labels, value: value });
+  }
+  return samples;
+}
+
+function indexByName(samples) {
+  const map = new Map();        // name -> {labels -> value}
+  for (const s of samples) {
+    let inner = map.get(s.name);
+    if (!inner) { inner = new Map(); map.set(s.name, inner); }
+    inner.set(s.labels, s.value);
+  }
+  return map;
+}
+
+// 取"无 label"的标量值；没有就返回 0（新起的服务还没上报时不该报错）。
+function scalar(idx, name) {
+  const inner = idx.get(name);
+  if (!inner) return 0;
+  const v = inner.get("");
+  return typeof v === "number" ? v : 0;
+}
+
+// 优先用框架已经算好的便捷 gauge：qzrpc_server_request_latency_us_p99（单位微秒）。
+// MetricsRegistry::DumpText 会把 _p50/_p90/_p99/_p999/_mean_us/_max_us 作为独立
+// gauge 族输出（因为 Prometheus 文本格式不允许同一族混类型），直接用它比按桶
+// 估更准——桶是 2 的幂，只能给出"≤ 上界"。
+// 返回 {us, estimated}：estimated=true 表示这是桶上界估算（显示时带 ≤），
+// false 表示取到了框架算好的精确分位数。区分这一点是为了不把估算值
+// 伪装成精确值——运维看到 "≤" 才知道该怀疑精度。
+function percentileFromGauge(idx, baseName, p) {
+  const gauge = scalar(idx, baseName + "_p" + Math.round(p * 100));
+  if (gauge > 0) return { us: gauge, estimated: false };
+  const fromBuckets = percentileFromBuckets(idx, baseName, p);
+  return fromBuckets === null ? null : { us: fromBuckets, estimated: true };
+}
+
+// 退化路径：从直方图的 _bucket 里估。桶是 2 的幂，返回值是"≤ le"的上界。
+function percentileFromBuckets(idx, baseName, p) {
+  const buckets = [];
+  const count = scalar(idx, baseName + "_count");
+  if (count <= 0) return null;
+
+  for (const [name, inner] of idx) {
+    if (name !== baseName + "_bucket") continue;
+    for (const [labels, value] of inner) {
+      const m = /le="([^"]*)"/.exec(labels);
+      if (!m) continue;
+      const le = m[1] === "+Inf" ? Infinity : Number(m[1]);
+      if (!Number.isFinite(le)) continue;
+      buckets.push({ le: le, cum: value });
+    }
+  }
+  if (buckets.length === 0) return null;
+  buckets.sort((a, b) => a.le - b.le);
+
+  const target = p * count;
+  for (const b of buckets) {
+    if (b.cum >= target) return b.le;   // 单位：微秒
+  }
+  return buckets[buckets.length - 1].le;
+}
+
+// ---------------------------------------------------------------------------
+// 状态
+// ---------------------------------------------------------------------------
+const HISTORY = 60;
+const hist = {
+  qps: [],
+  p50: [],
+  p99: [],
+};
+let prev = null;                // { t, request, response, error, rejected, connectionTotal }
+let timer = null;
+let autoOn = true;
+
+const el = (id) => document.getElementById(id);
+
+function fmt(n, digits) {
+  if (n === null || n === undefined || !Number.isFinite(n)) return "—";
+  return n.toFixed(digits === undefined ? 0 : digits);
+}
+
+function setStatus(kind, text) {
+  const dot = el("dot");
+  dot.className = "dot" + (kind ? " " + kind : "");
+  el("status").textContent = text;
+}
+
+// ---------------------------------------------------------------------------
+// 采样一次
+// ---------------------------------------------------------------------------
+async function sample() {
+  const url = el("url").value.trim();
+  const begin = performance.now();
+  let text = "";
+  try {
+    // 4 秒超时：/metrics 是本地小响应，卡住说明对端有问题，不要无限等。
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    const resp = await fetch(url, { cache: "no-store", signal: controller.signal });
+    clearTimeout(timeout);
+    if (!resp.ok) {
+      throw new Error("HTTP " + resp.status);
+    }
+    text = await resp.text();
+  } catch (err) {
+    setStatus("bad", "采集失败：" + (err && err.message ? err.message : String(err)));
+    // 采样失败时不清空历史：图表的"断点"本身也是信息。
+    return;
+  }
+
+  const costMs = performance.now() - begin;
+  const idx = indexByName(parsePrometheus(text));
+
+  // ---- 累加量 ----
+  const request = scalar(idx, "qzrpc_server_request_total");
+  const response = scalar(idx, "qzrpc_server_response_total");
+  const error = scalar(idx, "qzrpc_server_error_total");
+  const rejected = scalar(idx, "qzrpc_server_rejected_total");
+  const connectionActive = scalar(idx, "qzrpc_server_connection_active");
+  const connectionTotal = scalar(idx, "qzrpc_server_connection_total");
+  const queueWaitBuckets = idx.has("qzrpc_server_queue_wait_us_bucket");
+
+  // ---- 百分位（微秒 → 毫秒）----
+  const latencyBase = "qzrpc_server_request_latency_us";
+  const p50raw = percentileFromGauge(idx, latencyBase, 0.50);
+  const p99raw = percentileFromGauge(idx, latencyBase, 0.99);
+  const meanUs = scalar(idx, latencyBase + "_mean_us");
+  const maxUs = scalar(idx, latencyBase + "_max_us");
+  const p50 = p50raw === null ? null : p50raw.us / 1000;
+  const p99 = p99raw === null ? null : p99raw.us / 1000;
+
+  // ---- 差分 ----
+  const now = performance.now();
+  let qps = null;
+  let errRate = null;
+  let dRequest = 0, dResponse = 0, dError = 0, dRejected = 0;
+  if (prev !== null) {
+    const dt = (now - prev.t) / 1000;
+    dRequest = request - prev.request;
+    dResponse = response - prev.response;
+    dError = error - prev.error;
+    dRejected = rejected - prev.rejected;
+    // 反向差分 = 进程重启（计数器归零）。此时 QPS 无意义，显示 — 而不是负数。
+    const reset = dRequest < 0 || dError < 0;
+    if (!reset && dt > 0.05) {
+      qps = dRequest / dt;
+      if (dRequest > 0) errRate = 100 * dError / dRequest;
+    }
+  }
+  prev = { t: now, request, response, error, rejected };
+
+  // ---- KPI ----
+  el("kpi-qps").textContent = qps === null ? "—" : fmt(qps, 1);
+  el("kpi-p99").textContent =
+      p99 === null ? "—" : (p99raw.estimated ? "≤ " : "") + fmt(p99, 2);
+  el("kpi-err").textContent = errRate === null ? "—" : fmt(errRate, 2);
+  el("kpi-conn").textContent = fmt(connectionActive, 0);
+
+  // ---- 历史与图表 ----
+  if (qps !== null) {
+    hist.qps.push(qps);
+    hist.p50.push(p50 === null ? 0 : p50);
+    hist.p99.push(p99 === null ? 0 : p99);
+    while (hist.qps.length > HISTORY) {
+      hist.qps.shift(); hist.p50.shift(); hist.p99.shift();
+    }
+  }
+  drawLine("line-qps", hist.qps, "#4f9cf9");
+  drawLine("line-p50", hist.p50, "#38d39f");
+  drawLine("line-p99", hist.p99, "#f0b429");
+  const maxQps = hist.qps.length ? Math.max(...hist.qps) : 0;
+  el("qps-range").textContent = hist.qps.length
+    ? "当前 " + fmt(qps, 1) + " / 峰值 " + fmt(maxQps, 1) + " req/s · " + hist.qps.length + " 点"
+    : "样本不足（需要至少两次采样）";
+  // 图例同时给"窗口内峰值 P99"与"服务端全生命周期 mean/max"，两者口径不同：
+  // 前者只看最近 60 个采样点（能看出抖动），后者是进程启动至今的累计（能看总量级）。
+  const maxLat = hist.p99.length ? Math.max(...hist.p99) : 0;
+  const parts = [];
+  if (hist.p99.length) parts.push("窗口峰值 P99 " + fmt(maxLat, 2) + " ms");
+  if (meanUs > 0) parts.push("全量均值 " + fmt(meanUs / 1000, 2) + " ms");
+  if (maxUs > 0) parts.push("历史最大 " + fmt(maxUs / 1000, 2) + " ms");
+  el("lat-range").textContent = parts.join(" · ");
+
+  // ---- 计数表 ----
+  renderCounters([
+    ["qzrpc_server_request_total", request, dRequest, "累计请求数（含重试）"],
+    ["qzrpc_server_response_total", response, dResponse, "累计响应数"],
+    ["qzrpc_server_error_total", error, dError, "非 ok 响应数"],
+    ["qzrpc_server_rejected_total", rejected, dRejected, "过载主动拒绝数"],
+    ["qzrpc_server_connection_total", connectionTotal, null, "累计 accept 的连接数"],
+    ["qzrpc_server_connection_active", connectionActive, null, "当前活跃连接（Inc/Dec 共用）"],
+  ]);
+
+  setStatus(
+    "ok",
+    "采集成功 · " + fmt(costMs, 1) + " ms · " +
+    new Date().toLocaleTimeString("zh-CN", { hour12: false }) +
+    (queueWaitBuckets ? "" : " · 队列等待直方图尚未上报")
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SVG 折线（viewBox 固定 600×130，preserveAspectRatio=none 让它随容器拉伸）
+// ---------------------------------------------------------------------------
+function drawLine(id, values, color) {
+  const polyline = el(id);
+  if (!polyline) return;
+  if (values.length === 0) {
+    polyline.setAttribute("points", "");
+    return;
+  }
+  const width = 600;
+  const height = 130;
+  const padding = 6;
+  const max = Math.max(...values, 1);
+  const step = values.length > 1 ? width / (values.length - 1) : width;
+  const points = values.map((v, i) => {
+    const x = i * step;
+    const y = height - padding - (v / max) * (height - padding * 2);
+    return x.toFixed(1) + "," + y.toFixed(1);
+  });
+  polyline.setAttribute("points", points.join(" "));
+  polyline.setAttribute("stroke", color);
+}
+
+function renderCounters(rows) {
+  const tbody = el("counters").querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const [name, value, delta, meaning] of rows) {
+    const tr = document.createElement("tr");
+    const tdName = document.createElement("td");
+    tdName.textContent = name;
+    const tdValue = document.createElement("td");
+    tdValue.className = "num";
+    tdValue.textContent = fmt(value, 0);
+    const tdDelta = document.createElement("td");
+    tdDelta.className = "num dim";
+    tdDelta.textContent = delta === null || delta === undefined ? "—" : "+" + fmt(delta, 0);
+    const tdMean = document.createElement("td");
+    tdMean.className = "dim";
+    tdMean.textContent = meaning;
+    tr.append(tdName, tdValue, tdDelta, tdMean);
+    tbody.appendChild(tr);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 自动刷新
+// ---------------------------------------------------------------------------
+function startAuto() {
+  if (timer !== null) clearInterval(timer);
+  timer = setInterval(sample, 3000);
+  autoOn = true;
+  el("toggle").textContent = "暂停自动刷新";
+  el("toggle").classList.add("on");
+  el("interval-text").textContent = "每 3 秒";
+}
+
+function stopAuto() {
+  if (timer !== null) clearInterval(timer);
+  timer = null;
+  autoOn = false;
+  el("toggle").textContent = "继续自动刷新";
+  el("toggle").classList.remove("on");
+  el("interval-text").textContent = "已暂停";
+}
+
+el("refresh").addEventListener("click", sample);
+el("toggle").addEventListener("click", () => { autoOn ? stopAuto() : startAuto(); });
+el("url").addEventListener("change", () => {
+  // 换地址时清掉旧历史与差分基准，否则图表里会混两个实例的数据。
+  prev = null;
+  hist.qps = []; hist.p50 = []; hist.p99 = [];
+  drawLine("line-qps", [], "#4f9cf9");
+  drawLine("line-p50", [], "#38d39f");
+  drawLine("line-p99", [], "#f0b429");
+  el("qps-range").textContent = "已切换地址，等待两次采样";
+  sample();
+});
+
+// 首屏立刻采一次，然后进 3 秒节奏。
+sample();
+startAuto();
+</script>
+</body>
+</html>

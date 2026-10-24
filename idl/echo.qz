@@ -1,0 +1,58 @@
+// 轻舟 RPC 示例 IDL
+// 文件：idl/echo.qz
+// 说明：本文件是 doc 04（04-idl-spec.md）中"代码生成物契约"的输入，
+//       也是 qzcodegen 的黄金测试用例。修改它必须同步修改 doc 04 的生成物示例。
+//
+// 生成命令：
+//   python -m qzcodegen --input idl/echo.qz --out generated --cpp
+// 产物：
+//   generated/echo.qz.h
+//   generated/echo.qz.cpp
+
+syntax = "qz1";
+
+package demo;
+
+// 站点类型（枚举值必须从 0 开始连续，v1 不支持显式负数）。
+enum SiteType {
+  UNKNOWN = 0;
+  BLOG    = 1;
+  NEWS    = 2;
+  VIDEO   = 3;
+}
+
+// 嵌套消息：会被打平成独立的 C++ 类 demo::EchoBody，
+// 但 type_name 记录为 "demo.EchoBody"，与 protobuf 的嵌套语义保持一致的可读名。
+message EchoBody {
+  string text   = 1;
+  int32  weight = 2;
+  double score  = 3;
+  bool   valid  = 4;
+}
+
+// 请求：覆盖 v1 支持的全部字段形态。
+message EchoRequest {
+  string          message = 1;                    // 单数 string
+  int32           repeat  = 2 [default = 1];      // 带默认值
+  repeated int32  ids     = 3;                    // repeated 数值 → 默认 packed
+  repeated string tags    = 4;                    // repeated string → 逐元素带 tag
+  optional string lang    = 5;                    // optional → 有 has_lang()
+  EchoBody        body    = 6;                    // 嵌套 message
+  bytes           raw     = 7;                    // bytes → std::string
+  SiteType        site    = 8;                    // enum
+}
+
+// 响应
+message EchoResponse {
+  string message   = 1;
+  int32  served_by = 2;
+}
+
+// 服务
+service EchoService {
+  // 幂等方法：客户端允许自动重试
+  rpc Echo(EchoRequest) returns (EchoResponse) [idempotent = true];
+
+  // 非幂等：默认不重试
+  rpc Notify(EchoRequest) returns (EchoResponse);
+}

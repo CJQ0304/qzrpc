@@ -1,0 +1,453 @@
+"""test_golden.py —— 生成物与仓库里 `generated/` 的提交内容逐字节一致。
+
+这个测试防的是"改了生成器忘了重新生成"：这种 bug 在运行期完全看不出来，
+但会让 example/ 里的代码与 IDL 悄悄脱节。另外它也防"生成器不确定"——
+同一输入两次运行必须产出相同的字节（否则 CI 的 --check 永远失败）。
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+
+from _support import repo_root
+
+from qzcodegen import compile_files, file_stem, write_outputs
+from qzcodegen.cpp_generator import CppGenerator, GenerateOptions, generate
+
+IDL_RELATIVE = "idl/echo.qz"
+HEADER_RELATIVE = "generated/echo.qz.h"
+SOURCE_RELATIVE = "generated/echo.qz.cpp"
+
+
+def _read_bytes(relative: str) -> bytes:
+    with open(os.path.join(repo_root(), relative), "rb") as handle:
+        return handle.read()
+
+
+def _generate_echo() -> tuple[str, str]:
+    """在内存里生成 echo.qz 的产物（不落盘）。"""
+    idl_path = os.path.join(repo_root(), IDL_RELATIVE)
+    nodes, bag = compile_files([idl_path], source_root=repo_root())
+    if bag.has_errors():
+        raise AssertionError("黄金输入有诊断错误：{}".format(bag.messages()))
+    node = nodes[0]
+    options = GenerateOptions(
+        source_rel_path=node.display_path, file_stem=file_stem(idl_path)
+    )
+    return generate(node, options)
+
+
+class TestGoldenFiles(unittest.TestCase):
+    """`generated/` 里提交的内容必须能由当前生成器原样重现。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.header, cls.source = _generate_echo()
+
+    def test_header_matches_committed_file(self):
+        committed = _read_bytes(HEADER_RELATIVE)
+        actual = self.header.encode("utf-8")
+        if committed != actual:
+            self.fail(_diff_hint("generated/echo.qz.h", committed, actual))
+
+    def test_source_matches_committed_file(self):
+        committed = _read_bytes(SOURCE_RELATIVE)
+        actual = self.source.encode("utf-8")
+        if committed != actual:
+            self.fail(_diff_hint("generated/echo.qz.cpp", committed, actual))
+
+    def test_committed_files_are_utf8_without_bom(self):
+        for relative in (HEADER_RELATIVE, SOURCE_RELATIVE):
+            data = _read_bytes(relative)
+            self.assertFalse(
+                data.startswith(b"\xef\xbb\xbf"), "{} 不应带 UTF-8 BOM".format(relative)
+            )
+            # 必须能按 UTF-8 解码（源注释是中文）
+            data.decode("utf-8")
+
+    def test_no_carriage_returns(self):
+        for relative in (HEADER_RELATIVE, SOURCE_RELATIVE):
+            data = _read_bytes(relative)
+            self.assertNotIn(b"\r", data, "{} 里混进了 \\r".format(relative))
+
+    def test_files_end_with_single_newline(self):
+        for relative in (HEADER_RELATIVE, SOURCE_RELATIVE):
+            data = _read_bytes(relative)
+            self.assertTrue(data.endswith(b"\n"))
+            self.assertFalse(data.endswith(b"\n\n"))
+
+
+class TestIdempotency(unittest.TestCase):
+    def test_two_runs_produce_identical_bytes(self):
+        first_header, first_source = _generate_echo()
+        second_header, second_source = _generate_echo()
+        self.assertEqual(first_header, second_header)
+        self.assertEqual(first_source, second_source)
+
+    def test_write_outputs_is_stable_and_skips_unchanged(self):
+        idl_path = os.path.join(repo_root(), IDL_RELATIVE)
+        nodes, bag = compile_files([idl_path], source_root=repo_root())
+        self.assertFalse(bag.has_errors())
+        with tempfile.TemporaryDirectory() as out_dir:
+            first = write_outputs(nodes, out_dir, source_root=repo_root())
+            self.assertTrue(all(written for _, written in first))
+            first_bytes = {}
+            for path, _ in first:
+                with open(path, "rb") as handle:
+                    first_bytes[path] = handle.read()
+            second = write_outputs(nodes, out_dir, source_root=repo_root())
+            self.assertFalse(
+                any(written for _, written in second),
+                "内容没变时不应重写文件（避免无意义的 mtime 抖动）",
+            )
+            for path, _ in second:
+                with open(path, "rb") as handle:
+                    self.assertEqual(handle.read(), first_bytes[path])
+
+    def test_no_timestamp_by_default(self):
+        header, source = _generate_echo()
+        self.assertIn("<reproducible>", header)
+        self.assertIn("<reproducible>", source)
+
+    def test_timestamp_is_written_when_supplied(self):
+        idl_path = os.path.join(repo_root(), IDL_RELATIVE)
+        nodes, _ = compile_files([idl_path], source_root=repo_root())
+        options = GenerateOptions(
+            source_rel_path=nodes[0].display_path,
+            file_stem="echo",
+            timestamp="2024-05-01T12:00:00Z",
+        )
+        header, _ = generate(nodes[0], options)
+        self.assertIn("生成时间 : 2024-05-01T12:00:00Z", header)
+
+
+class TestContract(unittest.TestCase):
+    """doc 04 §6 的硬性要求：文件头、guard 宏、对外符号、方法 id 常量。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.header, cls.source = _generate_echo()
+        cls.header_bytes = cls.header.encode("utf-8")
+
+    def test_do_not_edit_banner(self):
+        self.assertIn("// Generated by qzcodegen. DO NOT EDIT.", self.header)
+        self.assertIn("// Generated by qzcodegen. DO NOT EDIT.", self.source)
+
+    def test_source_path_is_relative_and_posix(self):
+        self.assertIn("// 源文件   : idl/echo.qz", self.header)
+        self.assertNotIn(repo_root().replace("\\", "/"), self.header)
+        self.assertNotIn("D:", self.header)
+
+    def test_protocol_and_runtime_lines(self):
+        self.assertIn("// 协议版本 : 1", self.header)
+        self.assertIn("// 运行时   : qzrpc >= 0.1.0", self.header)
+
+    def test_include_guard_macro(self):
+        guard = "QZRPC_GENERATED_DEMO_ECHO_QZ_H_"
+        self.assertIn("#pragma once", self.header)
+        self.assertIn("#ifndef {}".format(guard), self.header)
+        self.assertIn("#define {}".format(guard), self.header)
+        self.assertIn("#endif  // {}".format(guard), self.header)
+
+    def test_required_runtime_includes(self):
+        for header in (
+            '#include "client/channel.h"',
+            '#include "common/status.h"',
+            '#include "serialize/message.h"',
+            '#include "server/dispatcher.h"',
+            '#include "server/service_registry.h"',
+        ):
+            self.assertIn(header, self.header)
+
+    def test_bundled_header_include_in_source(self):
+        self.assertIn('#include "echo.qz.h"', self.source)
+
+    def test_public_symbols_exist(self):
+        symbols = [
+            "enum class SiteType : std::int32_t {",
+            "const char* SiteType_Name(SiteType value);",
+            "bool SiteType_Parse(const std::string& name, SiteType* out);",
+            "class EchoBody final : public qzrpc::serde::Message {",
+            "class EchoRequest final : public qzrpc::serde::Message {",
+            "class EchoResponse final : public qzrpc::serde::Message {",
+            "class EchoServiceStub {",
+            "class EchoServiceBase {",
+            "class EchoServiceDispatcher {",
+            "std::unique_ptr<EchoServiceDispatcher> RegisterEchoService(",
+            'static constexpr const char* kServiceFullName = "demo.EchoService";',
+        ]
+        for symbol in symbols:
+            self.assertIn(symbol, self.header, "生成头文件缺少符号：{}".format(symbol))
+
+    def test_message_overrides_are_declared(self):
+        for signature in (
+            "const char* TypeName() const override;",
+            "void Clear() override;",
+            "bool Encode(qzrpc::serde::Writer* writer) const override;",
+            "bool Decode(qzrpc::serde::Reader* reader) override;",
+            "const qzrpc::serde::FieldMeta* Fields(std::size_t* count) const override;",
+        ):
+            self.assertIn(signature, self.header)
+
+    def test_method_id_constants(self):
+        self.assertIn("static constexpr std::uint32_t kMethodIdEcho = 0x21678893U;", self.header)
+        self.assertIn("static constexpr std::uint32_t kMethodIdNotify = 0x9AF18CAFU;", self.header)
+        self.assertIn("static std::uint32_t MethodIdEcho() noexcept;", self.header)
+        self.assertIn("return kMethodIdEcho;", self.source)
+        self.assertIn("return kMethodIdNotify;", self.source)
+
+    def test_field_metadata_table(self):
+        self.assertIn("static const qzrpc::serde::FieldMeta kFields[] = {", self.source)
+        self.assertIn(
+            '{6, "body",    qzrpc::serde::FieldType::kMessage, "demo.EchoBody"', self.source
+        )
+        self.assertIn(
+            '{2, "repeat",  qzrpc::serde::FieldType::kInt32,   nullptr,         false, '
+            "false, true,",
+            self.source,
+        )
+
+    def test_default_arguments_only_in_header(self):
+        # C++ 规定默认实参只能出现一处：.h 里有，.cpp 里不能再写
+        self.assertIn("const qzrpc::rpc::CallOptions& options = {});", self.header)
+        self.assertNotIn("= {});", self.source)
+
+    def test_anonymous_namespace_for_handlers(self):
+        self.assertIn("namespace {", self.source)
+        self.assertIn("qzrpc::Status HandleEcho(", self.source)
+        self.assertIn("qzrpc::Status HandleNotify(", self.source)
+
+    def test_unknown_fields_are_reemitted(self):
+        # message.h 承诺"读改写不丢字段"。这句话只能由 Encode 兑现：
+        # Decode 把未知字段存进 unknown_fields()，Encode 必须原样写回去。
+        # 这条契约很容易在重构时被静默丢掉，所以钉住它。
+        self.assertIn(
+            "for (const qzrpc::serde::UnknownField& unknown : unknown_fields())",
+            self.source,
+        )
+        self.assertIn("writer->WriteTag(unknown.number, unknown.wire_type);", self.source)
+        self.assertIn("writer->WriteRaw(unknown.raw.data(), unknown.raw.size());", self.source)
+
+    def test_packed_fields_skip_empty_container(self):
+        # 空 repeated 字段不能写 tag：否则 ByteSize() 从 0 变成 2，
+        # 且违反 proto3 "默认值不输出"。
+        start = self.source.index("field 3: repeated int32 ids")
+        block = self.source[start : start + 400]
+        self.assertIn("if (!ids_.empty()) {", block)
+
+    def test_no_global_variables(self):
+        # doc 04 §6.5 S-04：生成物不定义任何全局变量
+        for line in self.source.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("//") or stripped.startswith("#"):
+                continue
+            self.assertNotRegex(
+                stripped,
+                r"^static\s+\w+\s+\w+\s*=",
+                "生成物里出现了全局静态变量：{}".format(stripped),
+            )
+
+    def test_code_outside_comments_is_ascii(self):
+        # 注释里可以写中文；代码本体必须是纯 ASCII，避免不同编译器代码页下的惊喜
+        for relative, text in ((HEADER_RELATIVE, self.header), (SOURCE_RELATIVE, self.source)):
+            for number, line in enumerate(text.splitlines(), start=1):
+                code = line.split("//", 1)[0]
+                try:
+                    code.encode("ascii")
+                except UnicodeEncodeError:
+                    self.fail(
+                        "{}:{} 的代码部分出现非 ASCII 字符：{!r}".format(
+                            relative, number, line
+                        )
+                    )
+
+    def test_no_absolute_paths(self):
+        for text in (self.header, self.source):
+            self.assertNotIn("\\\\", text)
+            self.assertNotIn("C:/", text)
+
+
+def _diff_hint(name: str, committed: bytes, actual: bytes) -> str:
+    committed_lines = committed.decode("utf-8", "replace").splitlines()
+    actual_lines = actual.decode("utf-8", "replace").splitlines()
+    for index in range(max(len(committed_lines), len(actual_lines))):
+        old = committed_lines[index] if index < len(committed_lines) else "<eof>"
+        new = actual_lines[index] if index < len(actual_lines) else "<eof>"
+        if old != new:
+            return (
+                "{} 与生成器输出不一致（第 {} 行）\n"
+                "  仓库里: {!r}\n"
+                "  生成器: {!r}\n"
+                "  —— 改了生成器就重新跑一次 qzcodegen 并把产物一起提交".format(
+                    name, index + 1, old, new
+                )
+            )
+    return "{} 与生成器输出长度不一致（仓库 {} 字节 / 生成 {} 字节）".format(
+        name, len(committed), len(actual)
+    )
+
+
+FIXTURE_RELATIVE = "codegen/tests/fixtures/kitchen_sink.qz"
+
+
+def _generate_fixture() -> tuple[str, str]:
+    path = os.path.join(repo_root(), FIXTURE_RELATIVE)
+    nodes, bag = compile_files([path], source_root=repo_root())
+    if bag.has_errors():
+        raise AssertionError("fixture 有诊断错误：{}".format(bag.messages()))
+    node = nodes[0]
+    options = GenerateOptions(
+        source_rel_path=node.display_path, file_stem=file_stem(path)
+    )
+    return generate(node, options)
+
+
+class TestFixtureCoverage(unittest.TestCase):
+    """打满分支的 fixture：用纯 Python 检查生成物形状。
+
+    echo.qz 只覆盖 8 种字段形态，跑它"零警告"并不能说明生成器正确——
+    历史事实：第一版生成器在 echo 上全绿，一上这份 fixture 就爆出 4 个真 bug。
+    这里把"形状"层面的检查自动化，兜住其中不需要 C++ 编译器就能发现的部分：
+    花括号是否平衡、有没有格式化占位符泄漏、访问器名有没有被写成类名、
+    packed 与非 packed 的 tag 是否正确、空消息有没有生成 C4065 的 switch。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.header, cls.source = _generate_fixture()
+
+    def _code_lines(self, text: str):
+        for number, line in enumerate(text.splitlines(), start=1):
+            if line.strip().startswith("//") or line.strip().startswith("#"):
+                continue
+            yield number, line
+
+    def test_fixture_has_no_diagnostics(self):
+        _generate_fixture()  # 内部断言 has_errors() == False
+
+    def test_braces_are_balanced(self):
+        for name, text in (("header", self.header), ("source", self.source)):
+            depth = 0
+            for number, line in self._code_lines(text):
+                code = line.split("//", 1)[0]
+                depth += code.count("{") - code.count("}")
+                self.assertGreaterEqual(
+                    depth, 0, "{}:{} 出现多余的 '}}'".format(name, number)
+                )
+            self.assertEqual(depth, 0, "{} 花括号不平衡".format(name))
+
+    def test_no_format_placeholders_leaked(self):
+        # 合法的 `{}` 永远前面有空格（`= {}` 空初始化、`() {}` 空函数体）；
+        # 没被替换的占位符则是**紧贴**前一个 token 的（`void {}(`、`Handle{}`）。
+        import re
+
+        glued = re.compile(r"[A-Za-z0-9_>]\{\}")
+        for name, text in (("header", self.header), ("source", self.source)):
+            for number, line in self._code_lines(text):
+                self.assertIsNone(
+                    glued.search(line),
+                    "{}:{} 疑似泄漏了格式化占位符：{!r}".format(name, number, line),
+                )
+                self.assertNotIn("__", line, "{}:{} 泄漏了模板占位符".format(name, number))
+
+    def test_accessor_names_are_not_type_names(self):
+        # 历史 bug：`void set_x(std::size_t index, const T& value)` 被写成
+        # `void T(std::size_t index, const set_x& value)` —— 占位符实参顺序错。
+        path = os.path.join(repo_root(), FIXTURE_RELATIVE)
+        nodes, _ = compile_files([path], source_root=repo_root())
+        type_names = [decl.name for decl in nodes[0].iter_messages()]
+        type_names += [decl.name for decl in nodes[0].iter_enums()]
+        for type_name in type_names:
+            for prefix in ("void ", "bool ", "const "):
+                needle = "{}{}(".format(prefix, type_name)
+                self.assertNotIn(
+                    needle,
+                    self.header,
+                    "访问器名被写成了类型名：{}".format(needle),
+                )
+
+    def test_all_scalar_types_mapped(self):
+        # string/bytes 的 getter 返回 const 引用，其余按值返回
+        for field_name in ("f_string", "f_bytes"):
+            self.assertIn(
+                "const std::string& {}() const noexcept".format(field_name), self.header
+            )
+        pairs = [
+            ("f_int32", "std::int32_t"),
+            ("f_int64", "std::int64_t"),
+            ("f_uint32", "std::uint32_t"),
+            ("f_uint64", "std::uint64_t"),
+            ("f_sint32", "std::int32_t"),
+            ("f_sint64", "std::int64_t"),
+            ("f_bool", "bool"),
+            ("f_float", "float"),
+            ("f_double", "double"),
+        ]
+        for field_name, cpp_type in pairs:
+            self.assertIn(
+                "{} {}() const noexcept".format(cpp_type, field_name),
+                self.header,
+                "{} 的 getter 类型不对".format(field_name),
+            )
+
+    def test_repeated_accessors_exist_for_every_element_kind(self):
+        for field_name in ("r_int32", "r_string", "r_enum", "r_message"):
+            self.assertIn(
+                "std::size_t {}_size() const noexcept".format(field_name), self.header
+            )
+            self.assertIn("void add_{}(".format(field_name), self.header)
+            self.assertIn("void clear_{}() noexcept".format(field_name), self.header)
+
+    def test_optional_presence_accessors(self):
+        for field_name in ("o_int32", "o_string", "o_enum"):
+            self.assertIn("bool has_{}() const noexcept".format(field_name), self.header)
+            self.assertIn("void clear_{}() noexcept".format(field_name), self.header)
+        # 非 optional 的字段不能再有 presence
+        self.assertNotIn("bool has_f_int32()", self.header)
+
+    def test_packed_tag_uses_length_delimited(self):
+        # packed 字段：tag 必须是 kLengthDelimited + WriteLengthDelimited
+        block = self.source[self.source.index("field 20: repeated int32 r_int32") :]
+        block = block[: block.index("}")]
+        self.assertIn("WireType::kLengthDelimited", block)
+        self.assertIn("WriteLengthDelimited(packed.data().data(), packed.size())", block)
+        self.assertNotIn("WireType::kVarint", block)
+
+    def test_unpacked_repeated_uses_element_tag(self):
+        block = self.source[self.source.index("field 40: repeated int32 u_int32") :]
+        block = block[: block.index("  }")]
+        self.assertIn("WireType::kVarint", block)
+        self.assertIn("WriteInt32(value)", block)
+        self.assertNotIn("WriteLengthDelimited", block)
+
+    def test_empty_message_has_no_switch(self):
+        start = self.source.index("bool Empty::Decode(")
+        body = self.source[start : start + 700]
+        self.assertNotIn("switch (field)", body)
+        self.assertIn("SkipFieldCapture", body)
+
+    def test_multi_service_handler_names_are_prefixed(self):
+        # 同文件两个服务都有 Shared()：处理器名必须带服务前缀，否则匿名
+        # namespace 里会重定义
+        self.assertIn("qzrpc::Status HandleAlphaShared(", self.source)
+        self.assertIn("qzrpc::Status HandleBetaShared(", self.source)
+
+    def test_dotted_package_becomes_nested_qualifier(self):
+        self.assertIn("namespace stress::test {", self.header)
+        self.assertIn("stress::test::AlphaBase* service", self.source)
+        self.assertNotIn("stress.test::", self.source)
+
+    def test_extreme_default_literals(self):
+        # INT64_MIN 必须写成 (-9223372036854775807LL - 1)，否则 MSVC 报 C4146
+        self.assertIn("(-9223372036854775807LL - 1)", self.header)
+        self.assertIn("18446744073709551615ULL", self.header)
+
+    def test_explicit_method_id_is_used_verbatim(self):
+        self.assertIn("static constexpr std::uint32_t kMethodIdShared = 0x0000ABCDU;", self.header)
+
+
+
+if __name__ == "__main__":
+    unittest.main()

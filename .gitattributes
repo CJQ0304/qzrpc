@@ -1,0 +1,21 @@
+# 行尾统一成 LF，除了 Windows 的 .cmd/.bat（cmd.exe 对 LF-only 的批处理会出问题）。
+#
+# 为什么这条对本项目是**功能性**的，不是风格问题：
+#   CI 第 3 阶段会把 codegen 现场生成的 generated/echo.qz.{h,cpp} 与仓库里的版本做
+#   SHA256 逐字节比对。生成器写的是 LF；如果 git 在 Windows 上按 core.autocrlf 把
+#   工作区换成 CRLF，那么"新克隆的仓库 + 跑一次 CI"就必然红 —— 而代码其实没问题。
+#   行尾是版本控制最容易被忽略的一层"环境依赖"，这里把它钉死。
+* text=auto eol=lf
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+
+# 二进制：不参与行尾转换，也不做 diff 文本化
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.lib binary
+*.pdb binary

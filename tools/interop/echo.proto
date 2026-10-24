@@ -1,0 +1,44 @@
+// 轻舟 RPC —— 跨语言互通验证用 protobuf 定义
+//
+// 作用：本文件是 idl/echo.qz 的"手工等价翻译"，只用于验证
+//       「qzrpc 自研序列化输出的字节流能被官方 protobuf 解析器正确读取」，
+//       以及反向「官方 protobuf 序列化的字节流能被 qzrpc 正确解析」。
+//
+// 它**不是**项目的运行时依赖：框架本身零第三方依赖，
+// 这个 .proto 只在 tools/interop 的验证脚本里被 protoc 使用。
+//
+// 一致性约束：字段编号、字段类型、label 必须与 idl/echo.qz 逐条对应。
+
+syntax = "proto3";
+
+package demo;
+
+enum SiteType {
+  UNKNOWN = 0;
+  BLOG    = 1;
+  NEWS    = 2;
+  VIDEO   = 3;
+}
+
+message EchoBody {
+  string text   = 1;
+  int32  weight = 2;
+  double score  = 3;
+  bool   valid  = 4;
+}
+
+message EchoRequest {
+  string          message = 1;
+  int32           repeat  = 2;
+  repeated int32  ids     = 3;
+  repeated string tags    = 4;
+  optional string lang    = 5;
+  EchoBody        body    = 6;
+  bytes           raw     = 7;
+  SiteType        site    = 8;
+}
+
+message EchoResponse {
+  string message   = 1;
+  int32  served_by = 2;
+}
