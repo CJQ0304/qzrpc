@@ -24,6 +24,20 @@
 # MSVC note: under Git Bash, cl.exe needs Windows paths for every argument that is a
 # path. Passing /tmp/x.cpp straight through makes cl treat it as an option and fail
 # with "D8003: missing source filename". winpath() below does the cygpath -w dance.
+#
+# ★ HONESTY NOTE -- this file has NOT been executed on Linux or macOS.
+#   It was written against the same four stages as scripts/ci.ps1 (which runs green on
+#   Windows) and reviewed line by line, but the only machine available to its author
+#   runs MSVC. Concretely: the GCC/Clang branch, `-Werror` behaviour on the generated
+#   code under GCC, and the BSD userland of macOS have not been exercised.
+#   Saying so is more useful than shipping a script that *looks* cross-platform
+#   verified. If you run it somewhere else, expect to fix small things -- the two
+#   known portability traps (BSD `date +%s%N`, `sort -z`) are already worked around
+#   below, but there may be others.
+#
+# Portability rules followed here, because macOS ships BSD userland:
+#   * no `date +%s%N` (GNU only)   -> elapsed_ms() falls back to second precision
+#   * no `sort -z` / `find -print0` pairs (not in BSD sort) -> plain line loop
 
 set -euo pipefail
 
@@ -32,7 +46,28 @@ root="$(cd "${here}/.." && pwd)"
 build_dir="${root}/build"
 ci_dir="${build_dir}/ci"
 codegen_dir="${root}/codegen"
-python_bin="${PYTHON:-python3}"
+
+# Pick a Python and pin it to an ABSOLUTE path, then print it.
+#
+# Same lesson as the one that made one ctest case "Passed in PowerShell, skipped in
+# Git Bash": a bare name ("python3") is resolved against PATH at run time, so the same
+# command means different things in different shells on the same machine. Resolving it
+# once, up front, and echoing the winner turns a silent "skipped" into a visible fact.
+pick_python() {
+  if [ -n "${PYTHON:-}" ]; then printf '%s' "${PYTHON}"; return; fi
+  for cand in python3 python py; do
+    if command -v "${cand}" >/dev/null 2>&1; then command -v "${cand}"; return; fi
+  done
+  printf 'python3'
+}
+python_bin="$(pick_python)"
+
+if ! command -v "${python_bin}" >/dev/null 2>&1; then
+  printf 'ERROR: no python interpreter found (tried %s). Set PYTHON=/path/to/python3.\n' \
+    "${python_bin}" >&2
+  exit 1
+fi
+printf '==> python: %s\n' "${python_bin}"
 
 # Compiler selection: honour CXX, otherwise take the first one that actually exists.
 # On Windows/Git Bash there is no c++/g++, but cl.exe is present as soon as
@@ -51,6 +86,19 @@ cxx_base="$(basename "${cxx}")"
 
 step() { printf '\n==> %s\n' "$1"; }
 fail() { printf 'ERROR: %s\n' "$1" >&2; exit 1; }
+
+# Milliseconds since epoch, portably.
+# GNU date understands %N (nanoseconds); BSD/macOS date prints a literal "N", which
+# under `set -e` would turn the arithmetic below into a hard failure instead of a
+# timer bug. Detect that and fall back to whole seconds.
+now_ms() {
+  local raw
+  raw="$(date +%s%N 2>/dev/null || date +%s)"
+  case "${raw}" in
+    *N*|'') date +%s | awk '{ printf "%d", $1 * 1000 }' ;;
+    *) awk -v ns="${raw}" 'BEGIN { printf "%d", ns / 1000000 }' ;;
+  esac
+}
 
 # Convert a POSIX path to a Windows path when the compiler is cl.exe under MSYS/Git
 # Bash; identity elsewhere.
@@ -130,12 +178,15 @@ compile_gate() { # compile_gate <label> <input-pattern>
   gen "${input}" "${out}" --cpp || fail "codegen failed for ${input}"
 
   local sources=()
-  while IFS= read -r -d '' file; do sources+=("${file}"); done \
-    < <(find "${out}" -maxdepth 1 -name '*.cpp' -print0 | sort -z)
+  # Plain line-based loop instead of `find -print0 | sort -z`: BSD sort (macOS) has no
+  # -z, and generated file names never contain newlines, so the pair buys nothing.
+  while IFS= read -r file; do
+    [ -n "${file}" ] && sources+=("${file}")
+  done < <(find "${out}" -maxdepth 1 -name '*.cpp' | sort)
   [ "${#sources[@]}" -gt 0 ] || fail "no .cpp produced for ${input}"
 
   local start end file
-  start="$(date +%s%N)"
+  start="$(now_ms)"
   for file in "${sources[@]}"; do
     if [ "${is_msvc}" = "1" ]; then
       # MSYS/Git Bash rewrites any argument starting with '/' into a Windows path, so
@@ -159,8 +210,8 @@ compile_gate() { # compile_gate <label> <input-pattern>
         || fail "generated source does not compile: $(basename "${file}")"
     fi
   done
-  end="$(date +%s%N)"
-  printf '    %d TU(s) compiled in %d ms\n' "${#sources[@]}" "$(( (end - start) / 1000000 ))"
+  end="$(now_ms)"
+  printf '    %d TU(s) compiled in %d ms\n' "${#sources[@]}" "$(( end - start ))"
 }
 
 compile_gate idl 'idl/*.qz'

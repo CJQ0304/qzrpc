@@ -243,10 +243,18 @@ topology: echo_server 与 echo_client 是同机两个进程，走 loopback，中
 
 ## 已知边界
 
-- `scripts/ci.sh`（Linux / macOS）按设计编写并做过逐条评审，但**未在 GCC 上实机跑过**——
-  本机只有 MSVC。`scripts/ci.ps1` 的四阶段在 Windows 上是逐次跑绿的。这一点如实写在这里，
-  而不是用一个没跑过的脚本冒充"跨平台已验证"。
-- `bench.ps1` 的数字是 loopback 上的相对比较基准，不能当跨网络性能估计。
+- `scripts/ci.sh`（Linux / macOS）按设计编写并做过逐条评审，但**未在 GCC/Clang 上实机跑过**——
+  本机只有 MSVC。已经验证过的是：脚本语法（`bash -n`）、缺编译器时的前置失败提示、
+  以及 Stage 2/3 在两个**不同 Python 解释器**（3.x anaconda 与 3.13）下都产出与 `generated/`
+  逐字节相同的文件。未验证的是 GCC 分支的 `-Werror` 行为与 macOS BSD userland 的边角
+  （`date +%s%N`、`sort -z` 两处已知陷阱已在脚本里绕开）。
+  这一点如实写在这里，而不是用一个没跑过的脚本冒充"跨平台已验证"。
+- 这台构建机上 **`Start-Process` 不可用**（环境里同时有 `HTTP_PROXY` 与 `http_proxy`，
+  PowerShell 5.1 的 `env:` 驱动大小写敏感，`Start-Process` 枚举时报
+  "An item with the same key has already been added"）。`scripts/` 下的脚本一律用
+  `[System.Diagnostics.Process]` + `ProcessStartInfo`，不要改成 `Start-Process`。
+- `bench.ps1` 的数字是 loopback 上的相对比较基准，不能当跨网络性能估计；输出里的 `spread` 列
+  与 `!! noisy` 告警要一起读——机器被别的任务占着时，中位数也会失真。
 
 ---
 
