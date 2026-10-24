@@ -2,9 +2,9 @@
 <#
   Qingzhou RPC - benchmark runner (docs/00-file-map.md B-08).
 
-  Runs `echo_client --bench N T` over a matrix of thread counts, repeats each point
-  several times, and prints a Markdown table that can be pasted straight into the
-  README's performance section (the `<!-- BENCH -->` marker).
+  Runs `echo_client --bench N T --conns C` over a matrix of thread counts x connections
+  per endpoint, repeats each point several times, and prints a Markdown table that can be
+  pasted straight into the README's performance section (the `<!-- BENCH -->` marker).
 
   Why a matrix and repeats instead of one run:
     * one number from one run is not a measurement, it is an anecdote -- the first run
@@ -16,9 +16,6 @@
     * so: warmup, then N rounds per point, and report the MEDIAN with min..max next to
       it. If min and max are far apart, the machine was noisy -- that must be visible,
       not averaged away.
-
-  Also writes the machine profile into the output: a QPS number without the CPU model
-  and core count is not reproducible, so it is not evidence.
 
   READ THIS BEFORE QUOTING THE NUMBERS -- what a row means:
     Every row is labelled with BOTH knobs: `threads` and `conns` (connections per endpoint).

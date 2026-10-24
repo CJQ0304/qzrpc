@@ -46,6 +46,14 @@
   ctest TIMEOUT is 180s for this reason. A guard that trips on the healthy path (fresh
   build directory -> ctest, which is what CI does every day) is noise, not a guard.
 
+  DO NOT PIPE THIS SCRIPT WITHOUT DRAINING IT. Measured the hard way: running
+    powershell -File scripts\ci.ps1 *>&1 | Tee-Object -FilePath build\ci.log
+  hung for ten minutes at 55/74 with cl.exe sitting at 0.1s CPU. Nothing was wrong with
+  the tree -- the compile was blocked writing to a pipe whose consumer had stopped
+  reading. cl emits a lot of text with /showIncludes, so a full pipe is reached quickly.
+  Redirect straight to a file (`... *> build\ci.log`) or run it in a console; if you need
+  a pipeline, make sure the consumer keeps reading.
+
   OFFLINE: every stage runs with no network access. The toolchain is already on disk
   (msvc_env.cmd), the generator is local Python, and the only optional external tool
   (protoc, used by the interop_protobuf ctest case) self-skips with exit code 2 when it
