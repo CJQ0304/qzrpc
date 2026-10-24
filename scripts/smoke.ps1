@@ -7,7 +7,9 @@
     2. waits until /metrics answers -- not until some stdout line appears, because the
        endpoint answering IS the thing being tested
     3. samples each server's request_total / error_total (baseline)
-    4. runs echo_client --loop <Iterations> against it
+    4. runs echo_client --loop <Iterations> --max-retries 0 against it
+       (retries OFF on purpose: a gate that passes because a failed call was re-sent is a
+        gate that hides the failure. 0 also makes "fail=0" mean "no call ever failed".)
     5. samples the same counters again and asserts the DELTAS:
          sum(request_total delta) == Iterations   (every call arrived)
          sum(error_total delta)   == 0            (none of them failed)
@@ -305,7 +307,7 @@ try {
   if ($script:reason -eq '') {
     $serverList = (($ports | ForEach-Object { "127.0.0.1:$_" }) -join ',')
     $script:calls = $Iterations
-    Write-Diag ("echo_client --servers {0} --loop {1}" -f $serverList, $Iterations)
+    Write-Diag ("echo_client --servers {0} --loop {1} --max-retries 0" -f $serverList, $Iterations)
 
     # echo_client logs to stderr; in PowerShell a native command's stderr becomes an
     # ErrorRecord, and with $ErrorActionPreference='Stop' that is a terminating error on
@@ -313,7 +315,7 @@ try {
     # to data by capturing the two streams ourselves.
     $clientInfo = New-Object System.Diagnostics.ProcessStartInfo
     $clientInfo.FileName               = $clientExe
-    $clientInfo.Arguments              = ('--servers {0} --loop {1}' -f $serverList, $Iterations)
+    $clientInfo.Arguments              = ('--servers {0} --loop {1} --max-retries 0' -f $serverList, $Iterations)
     $clientInfo.UseShellExecute        = $false
     $clientInfo.CreateNoWindow         = $true
     $clientInfo.RedirectStandardOutput = $true

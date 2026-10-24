@@ -8,11 +8,15 @@
     2. registry    : start registry_main on 16160 (/metrics 9103)
     3. two servers : echo_server A on 16161 (/metrics 9101), B on 16162 (/metrics 9102),
                      both registering themselves into the registry
-    4. round robin : echo_client --loop N over both endpoints -> the split must be ~50/50
-    5. bench       : echo_client --bench 1000 4  -> 4000 concurrent calls, QPS + latency
-    6. star screen : each instance's own counters show 1 new TCP connection carrying 2000
-                     requests -- that is the client connection pool, measured
-    7. wrap up     : registry totals, summary, how to open example\web\index.html
+    4. round robin : echo_client --loop N --max-retries 0 over both endpoints -> split ~50/50
+                     (--max-retries 0 is part of the check: with retries left on, a failed
+                     call could be re-sent to the other instance and the split proves nothing)
+    5. bench A     : echo_client --bench 1000 4, connection count chosen by the client
+    6. bench B     : the same calls with --conns 1, plus each instance's own counters, so the
+                     "N requests over 1 connection" claim is measured rather than asserted
+    7. registry    : register_total / heartbeat_total -- registered AND still alive
+    8. failover    : kill B, then 20 calls with --max-retries 0 -> 20/20 served by A
+    9. wrap up     : summary, how to open example\web\index.html
     ... and it always stops every child it started (try/finally), unless -KeepRunning.
 
   USAGE
@@ -105,6 +109,11 @@ $loopA = 0
 $loopB = 0
 $benchQps = ''
 $benchP99 = ''
+$benchConns = ''
+$reuseQps = ''
+$capacityP99 = 0
+$reuseP99 = 0
+$failoverOk = $false
 $rows = @(
   [pscustomobject]@{ Name = 'A'; Conn = 0; Req = 0 }
   [pscustomobject]@{ Name = 'B'; Conn = 0; Req = 0 }
@@ -328,6 +337,15 @@ function Format-Metric($value) {
   return ('{0:N0}' -f $value)
 }
 
+# Pull one percentile out of the client's "latency_us : p50=.. p99=.." line.
+function Get-Percentile([string] $text, [string] $key) {
+  if ([string]::IsNullOrEmpty($text)) { return 0 }
+  foreach ($line in ($text -split "`r?`n")) {
+    if ($line -match "^\s*latency_us\s*:.*\b$key=(\d+)") { return [int]$Matches[1] }
+  }
+  return 0
+}
+
 # Run a child and wait for it. Returns ExitCode plus the decoded text.
 #
 # Decisions worth explaining:
@@ -460,8 +478,10 @@ try {
   # -------------------------------------------------------------------------
   # Step 4: round robin
   # -------------------------------------------------------------------------
-  Write-Step ("Round robin - echo_client --loop {0} over both endpoints" -f $Iterations)
+  Write-Step ("Round robin - echo_client --loop {0} --max-retries 0 over both endpoints" -f $Iterations)
   Write-Note ("expect: ~{0}/{0} split, one long-lived connection per endpoint" -f ($Iterations / 2))
+  Write-Note '--max-retries 0 is spelled out here on purpose: the split is only evidence if a'
+  Write-Note 'failed call cannot be quietly re-sent to the other instance. Same reason as step 8.'
   Write-Note 'note: the two --loop INFO lines on stderr are the Channel announcing'
   Write-Note '      conn_per_ep=1 + strategy=round_robin. That single pool slot per endpoint'
   Write-Note '      is what step 6 then shows carrying thousands of calls.'
@@ -469,7 +489,7 @@ try {
   $beforeA = Get-MetricValue (Get-MetricsText $MetricsPortA) 'qzrpc_server_request_total'
   $beforeB = Get-MetricValue (Get-MetricsText $MetricsPortB) 'qzrpc_server_request_total'
 
-  $loopRun = Invoke-Client @('--servers', $serverList, '--loop', "$Iterations")
+  $loopRun = Invoke-Client @('--servers', $serverList, '--loop', "$Iterations", '--max-retries', '0')
   if ($loopRun.ExitCode -ne 0) { Write-Bad ("echo_client --loop exited with {0}" -f $loopRun.ExitCode) }
 
   $textA = Get-MetricsText $MetricsPortA
@@ -487,16 +507,14 @@ try {
   }
 
   # -------------------------------------------------------------------------
-  # Step 5: bench
+  # Step 5: bench, capacity mode (connection count chosen by the client)
   # -------------------------------------------------------------------------
   $benchTotal = $BenchCalls * $BenchThreads
-  Write-Step ('Bench - {0} threads x {1} calls = {2} calls' -f $BenchThreads, $BenchCalls, $benchTotal)
-  Write-Note 'expect: QPS in the tens of thousands on loopback, p99 under ~1 ms, 0 errors'
-
-  $connBeforeA = Get-MetricValue $textA 'qzrpc_server_connection_total'
-  $connBeforeB = Get-MetricValue $textB 'qzrpc_server_connection_total'
-  $reqBeforeA  = Get-MetricValue $textA 'qzrpc_server_request_total'
-  $reqBeforeB  = Get-MetricValue $textB 'qzrpc_server_request_total'
+  Write-Step ('Bench A - capacity mode: {0} threads x {1} calls = {2} calls' -f `
+              $BenchThreads, $BenchCalls, $benchTotal)
+  Write-Note 'expect: 0 errors, p99 well under 1 ms. The absolute QPS depends on the box;'
+  Write-Note '        what makes it comparable is the [client] line below, which says how'
+  Write-Note '        many connections per endpoint this run used and where that number came from.'
 
   $benchRun = Invoke-Client @('--servers', $serverList, '--bench', "$BenchCalls", "$BenchThreads")
   $benchQps = ''
@@ -504,17 +522,37 @@ try {
   foreach ($line in ($benchRun.Text -split "`r?`n")) {
     if ($line -match '^\s*qps\s*:\s*([0-9.]+)') { $benchQps = $Matches[1] }
     if ($line -match '^\s*latency_us\s*:\s*(.+)$') { $benchP99 = $Matches[1].Trim() }
+    if ($line -match '^\[client\] connections_per_endpoint=(\d+)') { $benchConns = $Matches[1] }
   }
   if ($benchRun.ExitCode -ne 0) { Write-Bad ("echo_client --bench exited with {0}" -f $benchRun.ExitCode) }
   Write-Note 'max= is the first call on each connection (TCP + handshake); p99 excludes it.'
   Write-Note 'the "also:" line only appears when a status code other than overload/timeout occurs.'
+  Write-Note 'check the last [client] line: retry_total=0 means "errors: 0" above was not'
+  Write-Note '  produced by retrying anything (a retried call would show up there).'
 
   # -------------------------------------------------------------------------
-  # Step 6: star screen -- connections vs requests
+  # Step 6: star screen -- the same load, forced onto one connection per endpoint
   # -------------------------------------------------------------------------
-  Write-Step 'Star screen - one TCP connection per instance, thousands of requests on it'
-  Write-Note 'connections/requests are deltas measured around step 5 only;'
-  Write-Note 'active = connections open right now (the bench client has already exited, so 0).'
+  Write-Step ('Bench B - reuse mode: same {0} calls, but --conns 1' -f $benchTotal)
+  Write-Note 'this is the number that was silently broken before: with conns hard-wired to 1'
+  Write-Note 'every thread queued on one connection. Here it is asked for explicitly, so the'
+  Write-Note 'counters below mean what they say.'
+  Write-Note 'connections/requests are deltas measured around this step only;'
+  Write-Note 'active = connections open right now (the client has already exited, so 0).'
+
+  $textA = Get-MetricsText $MetricsPortA
+  $textB = Get-MetricsText $MetricsPortB
+  $connBeforeA = Get-MetricValue $textA 'qzrpc_server_connection_total'
+  $connBeforeB = Get-MetricValue $textB 'qzrpc_server_connection_total'
+  $reqBeforeA  = Get-MetricValue $textA 'qzrpc_server_request_total'
+  $reqBeforeB  = Get-MetricValue $textB 'qzrpc_server_request_total'
+
+  $reuseRun = Invoke-Client @('--servers', $serverList, '--bench', "$BenchCalls", "$BenchThreads", '--conns', '1')
+  $reuseQps = ''
+  foreach ($line in ($reuseRun.Text -split "`r?`n")) {
+    if ($line -match '^\s*qps\s*:\s*([0-9.]+)') { $reuseQps = $Matches[1] }
+  }
+  if ($reuseRun.ExitCode -ne 0) { Write-Bad ("echo_client --bench --conns 1 exited with {0}" -f $reuseRun.ExitCode) }
 
   $textA = Get-MetricsText $MetricsPortA
   $textB = Get-MetricsText $MetricsPortB
@@ -550,18 +588,33 @@ try {
   if (($totalConn -gt 0) -and ($totalReq -gt 0)) {
     Write-Host ('    {0} requests over {1} connection(s) -> {2:N0} requests per connection' -f `
                 $totalReq, $totalConn, ($totalReq / $totalConn)) -ForegroundColor Green
-    Write-Note 'the client pool keeps one long-lived connection per endpoint (conn_per_ep=1)'
-    Write-Note 'and multiplexes every call over it; without the pool each call would pay'
-    Write-Note 'a TCP + handshake round trip before the first byte of payload.'
+    Write-Note 'one connection per endpoint carried every one of those calls; without the'
+    Write-Note 'pool each call would pay a TCP + handshake round trip before its first byte.'
   } else {
     Write-Bad 'connection/request counters did not move -- /metrics may be stale'
   }
   if (($rows[0].Req + $rows[1].Req) -ne $benchTotal) {
-    Write-Bad ("bench sent {0} calls but the servers counted {1}" -f $benchTotal, ($rows[0].Req + $rows[1].Req))
+    Write-Bad ("sent {0} calls but the servers counted {1}" -f $benchTotal, ($rows[0].Req + $rows[1].Req))
+  }
+  if (($benchQps -ne '') -and ($reuseQps -ne '')) {
+    Write-Note 'both runs print their own qps above -- single observations, no noise control'
+    Write-Note '(the same config on this box can differ 2x run to run). Do not quote qps as'
+    Write-Note 'capacity; the p99 ratio below is the number that follows from the design.'
+  }
+
+  # p99 is the honest comparison: it is a direct consequence of "8 threads queueing on
+  # one connection", and unlike qps it does not move with whatever else is running on
+  # the machine. This pair is also printed in the summary.
+  $capacityP99 = Get-Percentile $benchRun.Text 'p99'
+  $reuseP99    = Get-Percentile $reuseRun.Text 'p99'
+  if (($capacityP99 -gt 0) -and ($reuseP99 -gt 0)) {
+    Write-Host ('    p99: capacity mode {0}us  vs  reuse mode {1}us  -> {2:N1}x' -f `
+                $capacityP99, $reuseP99, ([double]$reuseP99 / [double]$capacityP99)) -ForegroundColor Green
+    Write-Note 'same 4000 calls; the only difference is how many connections they queue on.'
   }
 
   # -------------------------------------------------------------------------
-  # Step 7: registry view + web page
+  # Step 7: registry view (both instances still alive at this point)
   # -------------------------------------------------------------------------
   if ($useRegistry) {
     Write-Step ("Registry view - who is registered ({0})" -f ("http://127.0.0.1:{0}/metrics" -f $RegistryMetricsPort))
@@ -585,6 +638,84 @@ try {
     }
   }
 
+  # -------------------------------------------------------------------------
+  # Step 8: failover with the retry budget at zero -- the screen the demo hangs on
+  #
+  # It has to be self-evidencing: with max_retries=0 there is no business retry left, so
+  # 20/20 can only come from the failover layer (a request that never left the client is
+  # moved to another endpoint without spending the budget -- channel.cpp's
+  # "failover vs retry" comment). The proof is echo_client's own
+  # "[client] max_retries=0 source=cli(--max-retries 0)" line.
+  # B is restarted afterwards so the page hint that follows still has two live endpoints.
+  # -------------------------------------------------------------------------
+  Write-Step 'Failover - kill instance B, then 20 calls with --max-retries 0'
+  Write-Note 'expect: 20/20 succeed and every response comes from A.'
+  Write-Note 'why this is a proof and not a claim: with --max-retries 0 there is no retry'
+  Write-Note '        budget left, so a call that never left the client can only be'
+  Write-Note '        re-pointed at another endpoint by the failover layer.'
+  Write-Note 'two lines to look for, both printed by the client itself:'
+  Write-Note '  [client] max_retries=0 source=cli(--max-retries 0)'
+  Write-Note '  [client] retry_total=0 failover_total=N   (N >= 1: switches really happened)'
+
+  $textA = Get-MetricsText $MetricsPortA
+  $reqBeforeFailover = Get-MetricValue $textA 'qzrpc_server_request_total'
+
+  $victim = $script:started | Where-Object { $_.Label -eq 'echo_server_B' } | Select-Object -First 1
+  if ($null -ne $victim) {
+    if (-not $victim.Process.HasExited) {
+      Stop-Process -Id $victim.Process.Id -Force -ErrorAction SilentlyContinue
+      [void]$victim.Process.WaitForExit(3000)
+    }
+    Write-Host ("    killed echo_server_B (pid {0}) on purpose" -f $victim.Process.Id)
+    $script:started.Remove($victim) | Out-Null
+  } else {
+    Write-Bad 'echo_server_B was not started by this script; cannot demonstrate failover'
+  }
+
+  $failoverRun = Invoke-Client @('--servers', $serverList, '--loop', '20', '--max-retries', '0')
+  if ($failoverRun.ExitCode -ne 0) {
+    Write-Bad ("failover run exited with {0}: a failed call means the failover layer did not cover it" -f $failoverRun.ExitCode)
+  }
+
+  # The client counts both budgets itself. Reading them beats asserting them: retry_total is
+  # the number of business retries the run consumed (must be 0 here) and failover_total is the
+  # number of endpoint switches (must be >= 1, otherwise nothing was ever re-pointed).
+  $retryTotal = $null
+  $failoverTotal = $null
+  foreach ($line in ($failoverRun.Text -split "`r?`n")) {
+    if ($line -match '^\[client\] retry_total=(\d+) failover_total=(\d+)') {
+      $retryTotal = [int]$Matches[1]
+      $failoverTotal = [int]$Matches[2]
+    }
+  }
+
+  $textA = Get-MetricsText $MetricsPortA
+  $failoverServed = [int]((Get-MetricValue $textA 'qzrpc_server_request_total') - $reqBeforeFailover)
+  if ($null -eq $retryTotal) {
+    Write-Bad 'echo_client did not print "[client] retry_total=.. failover_total=.." (cannot verify the claim)'
+  } elseif (($failoverRun.ExitCode -eq 0) -and ($failoverServed -eq 20) -and ($retryTotal -eq 0) -and ($failoverTotal -ge 1)) {
+    $failoverOk = $true
+    Write-Ok ("20/20 served by A with retry_total=0, failover_total={0} (switches, not retries)" -f $failoverTotal)
+  } elseif ($failoverServed -ne 20) {
+    Write-Bad ("A counted {0} of the 20 calls -- either B was not really dead or calls were lost" -f $failoverServed)
+  } elseif (($retryTotal -ne 0) -or ($failoverTotal -lt 1)) {
+    Write-Bad ("client counters do not support the claim: retry_total={0} failover_total={1}" -f $retryTotal, $failoverTotal)
+  }
+
+  if ($null -ne $victim) {
+    Write-Note 'restarting B so the next step (and -KeepRunning) leaves a healthy pair'
+    $restartedB = Start-Child 'echo_server_B' $script:serverExe @(
+      $baseArguments + @('--port', "$ServerPortB", '--metrics-port', "$MetricsPortB", '--log-level', '3'))
+    if (Wait-Metrics $MetricsPortB 'echo_server B (restarted)' $restartedB) {
+      Write-Ok ("B back up on port {0} (counters start from zero again)" -f $ServerPortB)
+    } else {
+      Write-Bad 'restarted echo_server B did not become ready'
+    }
+  }
+
+  # -------------------------------------------------------------------------
+  # Step 9: web page
+  # -------------------------------------------------------------------------
   Write-Step 'Web page - example\web\index.html'
   Write-Note 'it fetches these two endpoints from the browser:'
   Write-Host ('      http://127.0.0.1:{0}/metrics' -f $MetricsPortA)
@@ -635,10 +766,21 @@ Write-Host '================ summary ================' -ForegroundColor Cyan
 Write-Host ("  instances        : 2 echo_server (ports {0} / {1}), registry {2}" -f `
             $ServerPortA, $ServerPortB, $(if ($useRegistry) { "on $RegistryPort" } else { 'skipped' }))
 Write-Host ("  round robin      : A={0}  B={1}  of {2} sequential calls" -f $loopA, $loopB, $Iterations)
-Write-Host ("  bench            : {0} calls, qps={1}" -f $benchTotal, $(if ($benchQps -ne '') { $benchQps } else { 'n/a' }))
-if ($benchP99 -ne '') { Write-Host ("  latency          : {0}" -f $benchP99) }
+Write-Host ("  bench A (capacity): {0} calls, conns/ep={1}, p99={2}us" -f $benchTotal,
+            $(if ($benchConns -ne '') { $benchConns } else { '?' }), $capacityP99)
+Write-Host ("  bench B (reuse)  : {0} calls, conns/ep=1, p99={1}us" -f $benchTotal, $reuseP99)
+if (($capacityP99 -gt 0) -and ($reuseP99 -gt 0)) {
+  Write-Host ("  queueing cost    : p99 {0:N1}x worse when 4 threads share one connection" -f `
+              ([double]$reuseP99 / [double]$capacityP99))
+}
 Write-Host ("  connection reuse : A {0} conn / {1} reqs,  B {2} conn / {3} reqs" -f `
             $rows[0].Conn, $rows[0].Req, $rows[1].Conn, $rows[1].Req)
+Write-Host ("  failover         : {0}" -f $(if ($failoverOk) {
+  ("20/20 with max_retries=0 after killing B (retry_total=0, failover_total={0})" -f $failoverTotal)
+} else {
+  'NOT VERIFIED -- see the FAIL above'
+}))
+Write-Host '  (qps omitted on purpose: it is a single observation on a shared machine.)'
 Write-Host ''
 if ($script:failed -gt 0) {
   Write-Host ("DEMO FAILED: {0} check(s) failed" -f $script:failed) -ForegroundColor Red

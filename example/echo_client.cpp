@@ -32,6 +32,7 @@
 #include "client/client_options.h"
 #include "common/config.h"
 #include "common/logger.h"
+#include "common/metrics.h"
 #include "common/status.h"
 #include "common/string_util.h"
 #include "common/time_util.h"
@@ -48,6 +49,7 @@ struct Args {
   int count = 10;                    // loop/bench 的次数
   int threads = 1;                   // bench 的线程数
   int conns = 0;                     // 每 endpoint 连接数；0 = 未指定，按模式推导
+  int max_retries = -1;              // 覆盖 max_retries；-1 = 未指定
   int timeout_ms = 0;                // 0 = 用 ClientOptions 的默认值
   bool verbose = false;
 };
@@ -63,6 +65,9 @@ void PrintUsage(const char* argv0) {
       "  --bench N [T]       T 线程各调 N 次，输出 QPS / 延迟分位 / 错误分类\n"
       "  --conns N           每 endpoint 连接数（1..1024）。不给时：bench 取 max(8,T)，\n"
       "                      loop/once 取 1\n"
+      "  --max-retries N     业务重试次数（0..10）。不给时：conf 里有就用 conf，否则用\n"
+      "                      ClientOptions 的默认值。**不按端点数推导**：重试是语义\n"
+      "                      旋钮，推导错了是重复扣款，不是快慢问题\n"
       "  --timeout <ms>      单次调用超时（0 = 用配置默认值）\n"
       "  -v, --verbose       打印每次调用（在 --loop 下很有用）\n"
       "  -h, --help          显示本帮助\n"
@@ -151,6 +156,15 @@ bool ParseArgs(int argc, char** argv, Args* args, bool* show_help) {
         return false;
       }
       args->conns = static_cast<int>(parsed);
+    } else if (arg == "--max-retries") {
+      const char* value = next("--max-retries");
+      if (value == nullptr) return false;
+      const long parsed = std::strtol(value, nullptr, 10);
+      if (parsed < 0 || parsed > 10) {
+        std::fprintf(stderr, "--max-retries 必须在 0..10，收到 %s\n", value);
+        return false;
+      }
+      args->max_retries = static_cast<int>(parsed);
     } else if (arg == "--servers") {
       const char* value = next("--servers");
       if (value == nullptr) return false;
@@ -278,8 +292,9 @@ int main(int argc, char** argv) {
 
   // ---- 1. 配置 ----
   qzrpc::rpc::ClientOptions options;
-  // conf 里到底写没写 connections_per_endpoint？这决定了"连接数从哪来"。
+  // conf 里到底写没写 connections_per_endpoint / max_retries？这决定了"值从哪来"。
   bool conf_has_conns = false;
+  bool conf_has_retries = false;
   if (!args.conf_path.empty()) {
     qzrpc::Config config;
     std::string err;
@@ -292,6 +307,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     conf_has_conns = config.Has("Client", "connections_per_endpoint");
+    conf_has_retries = config.Has("Client", "max_retries");
   }
   if (!args.servers.empty()) {
     options.endpoints.clear();
@@ -341,10 +357,29 @@ int main(int argc, char** argv) {
     options.connections_per_endpoint = 1;
     conns_source = "auto(" + args.mode + ": single-threaded sequential)";
   }
-  if (!args.servers.empty() && args.servers.size() > 1) {
-    // 演示"分发"时不重试：失败请求若被重试掩盖，两边计数就看不出真实分布。
-    options.max_retries = 0;
-    std::printf("[client] max_retries=0 source=auto(multi-endpoint demo: retries would hide the real split)\n");
+  // ---- 重试预算：显式 > conf，**不推导** ----
+  //
+  // 这一条和上面的 connections_per_endpoint 故意不对称，理由是把两类旋钮分开看：
+  //   * connections_per_endpoint 是**性能**旋钮：推错了只影响快慢，不影响正确性；
+  //   * max_retries 是**语义**旋钮：它决定"失败之后会不会再发一次"。对非幂等调用，
+  //     重试就是重复扣款。**推导错了是正确性问题，不是性能问题。**
+  // 所以语义参数只允许两个来源：conf 与显式 CLI，永远不推导。
+  //
+  // 原先这里有一段"多 endpoint 就自动压成 0"的推导，条件还写的是 args.servers.size() > 1，
+  // 于是同一份逻辑配置出现了两种行为：
+  //   --servers 127.0.0.1:16161,127.0.0.1:16162   → retries=0
+  //   --conf example/conf/echo_client.conf（同样这两个）→ retries=2
+  // 决定"失败会不会重发"的居然是"端点怎么指定"，这正是我们反复在打的那一类
+  // "看起来一样、行为是另一个"。演示需要 retries=0 时，就显式写在命令里。
+  std::string retries_source;
+  if (args.max_retries >= 0) {
+    options.max_retries = args.max_retries;
+    retries_source = "cli(--max-retries " + std::to_string(args.max_retries) + ")";
+  } else if (conf_has_retries) {
+    // 值已经由 FromConfig 读进来了，这里一个字节都不要动。
+    retries_source = "conf(" + args.conf_path + ")";
+  } else {
+    retries_source = "default(ClientOptions)";
   }
   options.service_name = "demo.EchoService";
   options.caller_name = "echo_client";
@@ -355,16 +390,21 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // 两行来源日志挨在一起输出，中间不插目标信息：读的人一眼看完"这次跑的到底是什么配置"。
+  // 显式给的、conf 读到的、按模式推导的，必须能分辨；演示里"杀掉一个实例仍然 20/20"
+  // 那一屏全靠 max_retries=0 这一行自证——没有它，那句口播就只是断言。
+  std::printf("[client] connections_per_endpoint=%zu source=%s endpoints=%llu total_conns=%d\n",
+              options.connections_per_endpoint, conns_source.c_str(),
+              static_cast<unsigned long long>(options.endpoints.size()),
+              static_cast<int>(options.connections_per_endpoint * options.endpoints.size()));
+  std::printf("[client] max_retries=%d source=%s\n", options.max_retries, retries_source.c_str());
+
   std::printf("目标: ");
   for (std::size_t i = 0; i < options.endpoints.size(); ++i) {
     std::printf("%s%s:%u", i == 0 ? "" : ", ", options.endpoints[i].ip.c_str(),
                 static_cast<unsigned>(options.endpoints[i].port));
   }
   std::printf("  模式=%s\n", args.mode.c_str());
-  // 一行说清"连接数从哪来"。显式给的、conf 读到的、还是按模式推导的，必须能一眼分辨。
-  std::printf("[client] connections_per_endpoint=%d source=%s endpoints=%zu total_conns=%d\n",
-              options.connections_per_endpoint, conns_source.c_str(), options.endpoints.size(),
-              options.connections_per_endpoint * static_cast<int>(options.endpoints.size()));
 
   // ---- 2. 建 Channel 并启动 ----
   qzrpc::rpc::Channel channel(options);
@@ -566,6 +606,24 @@ int main(int argc, char** argv) {
     std::printf("# bytes = payload + %lluB/frame; metadata body not counted\n",
                 static_cast<unsigned long long>(kFrameOverhead));
     if (errors.total != 0) exit_code = 1;
+  }
+
+  // ---- 退出前报一次"语义计数器" ----
+  //
+  // retry / failover 这两个数必须和结果一起出现，否则"0 errors"是可以被重试掩盖的：
+  //   * retry_total    = 业务重试次数（请求**可能已经被对端看到**之后的重发）
+  //   * failover_total = 故障转移次数（一个字节都没发出去就换实例，不占 max_retries）
+  // 两者都取自客户端自己的 MetricsRegistry（channel.cpp 里注册的同名计数器），进程内累计；
+  // 一次运行就是一个新进程，所以这里打出来的就是"这一轮"的增量。
+  // 之所以不用日志级别控制：证据行不能因为日志过滤而消失。
+  {
+    qzrpc::MetricsRegistry& registry = qzrpc::MetricsRegistry::Instance();
+    const std::uint64_t retry_total = registry.GetCounter("qzrpc_client_retry_total")->value();
+    const std::uint64_t failover_total =
+        registry.GetCounter("qzrpc_client_failover_total")->value();
+    std::printf("[client] retry_total=%llu failover_total=%llu\n",
+                static_cast<unsigned long long>(retry_total),
+                static_cast<unsigned long long>(failover_total));
   }
 
   channel.Stop();
