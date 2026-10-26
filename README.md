@@ -228,7 +228,8 @@ git clone . /tmp/qzrpc-verify            # 全新目录：不带 build*、不带
 cd /tmp/qzrpc-verify && scripts\ci.ps1   # 从零 configure + build + ctest + 三道 codegen 闸门
 ```
 
-`ci.ps1` 的原始输出（2026-10-24，验证对象 **`56c9435`**，宿主 i9-14900HX / 32 逻辑核 / Win11 26200）：
+`ci.ps1` 的原始输出（2026-10-24，验证对象 **`56c9435`**，宿主 i9-14900HX / 32 逻辑核 / Win11 26200）。
+此后只改文档/注释的提交按同一条命令重跑结果不变——最近一次重跑：**14/14**、`CI_EXIT=0`、32.4s。
 
 ```
 ==> Stage 1/4: build + ctest
