@@ -130,7 +130,19 @@ void Connection::Send(const void* data, std::size_t len) {
   if (data == nullptr || len == 0) return;
   if (state() == State::kClosed) return;
   std::string copy(static_cast<const char*>(data), len);
-  Send(std::move(copy));  // 复用 std::string 重载：非 loop 线程同样会转投并只拷贝这一次
+  // 如实说明拷贝次数（旧注释写的是"只拷贝这一次"，那是错的）：
+  //   * 这里先按 len 拷进 std::string          → 第 1 次拷贝；
+  //   * 下面的 `Send(std::move(copy))` 绑到的是 `const std::string&` 形参，
+  //     **没有移动构造可走**，std::move 在这里是纯装饰；
+  //   * 进 `Send(const std::string&)` 之后：
+  //       - loop 线程路径：`SendInLoop(std::string(data))` → 第 2 次拷贝；
+  //       - 非 loop 线程路径：`payload = std::string(data)` → 第 2 次拷贝（之后是 move）。
+  //   所以走这个重载**最少 2 次拷贝**。
+  //
+  // 服务端回包正是从 worker 线程调进来的（跨线程路径），也就是说"2 次拷贝"是常态、
+  // 不是边角情况。要降到 1 次需要给 connection.h 加 `Send(std::string&&)` 重载
+  // （那要动冻结头），收益是每帧少一次 memcpy；先量再改，别靠注释假装已经优化过。
+  Send(std::move(copy));
 }
 
 void Connection::Send(const std::string& data) {

@@ -7,7 +7,9 @@
 //   * "容量检查"与"入队"在同一把锁内完成，因此 Submit 的返回值就是最终结论，
 //     不存在"检查通过但入队失败"的窗口（这是相对 phxrpc 两段式判断的改进）；
 //   * 队列满时默认返回 kRejected（不阻塞 IO 线程），上层据此回 OVERLOAD 帧；
-//   * Stop(drain=false) 会清空队列，保证停机不会被积压任务拖住。
+//   * Stop(drain=false) 会清空队列，保证停机不会被积压任务拖住；
+//   * **任务体抛出的异常就地收口**（记 ERROR 日志、照常计 completed），
+//     绝不让它穿过 WorkerLoop —— 线程函数里逃出去的异常 = std::terminate = 整个进程消失。
 //
 // 语义定义（写在这里避免误用）：
 //   * started_：线程已经启动；stopping_：已请求停止（running() = started_ && !stopping_）；
@@ -16,12 +18,32 @@
 
 #include "net/thread_pool.h"
 
+#include <exception>
 #include <utility>
+
+#include "common/logger.h"
 
 namespace qzrpc {
 namespace net {
 
 namespace {
+
+// 就地执行任务并收口异常。
+//
+// 为什么必须有这一层：线程池是**唯一**跑业务代码的地方（Dispatcher 的 handler 就在这里执行），
+// 而"handler 只返回 Status 不抛异常"这条约定没有任何机制强制 —— 业务实现里一句 std::stoi、
+// 一次 new、一次 substr 越界就能抛出来。异常从 WorkerLoop 逃出去，C++ 标准规定线程函数抛出
+// 未捕获异常即 std::terminate，代价是**整个 server 进程消失**，而不是"这一个请求回 kInternal"。
+// 这跟本项目反复强调的"过载不关连接、错误要可见"是同一个取舍：单请求的错误不该升级成进程级事件。
+void RunTaskNoThrow(const std::function<void()>& task) {
+  try {
+    task();
+  } catch (const std::exception& e) {
+    QZ_LOG_ERROR << "thread_pool: task threw: " << e.what();
+  } catch (...) {
+    QZ_LOG_ERROR << "thread_pool: task threw a non-std exception";
+  }
+}
 
 // 给工作线程起名（便于调试器/性能分析器识别）。
 //
@@ -101,7 +123,10 @@ void ThreadPool::WorkerLoop(std::size_t index) {
       queue_.pop_front();
       ++active_workers_;
     }
-    if (task) task();
+    // 抛异常的任务也算"已执行完"：completed 必须包含它，否则
+    // submitted == completed + queued + rejected 这条口径会在异常路径上破掉，
+    // 而运维看板就是按这个算的。catch 之后**不能 return** —— worker 要接着跑下一个任务。
+    if (task) RunTaskNoThrow(task);
     completed_total_.fetch_add(1, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -129,7 +154,9 @@ ThreadPool::SubmitResult ThreadPool::Submit(std::function<void()> task) {
   if (run_on_caller) {
     // "调用者运行"策略：用提交线程的响应性换"绝不丢任务"。
     // 服务端默认关闭该策略（IO 线程绝不能被业务逻辑占用）。
-    task();
+    // 异常同样就地收口：这里的"调用者"在服务端就是 IO 线程，异常从这里逃出去会顺着
+    // 事件循环一路传到 main → std::terminate，和 worker 里抛没有区别（代价一样是进程消失）。
+    RunTaskNoThrow(task);
     completed_total_.fetch_add(1, std::memory_order_relaxed);
     return SubmitResult::kOk;
   }

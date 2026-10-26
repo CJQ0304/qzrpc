@@ -143,7 +143,23 @@ void EventLoop::Loop() {
     QZ_LOG_ERROR << "event loop: Loop() called twice or re-entered, ignored";
     return;
   }
-  quit_.store(false, std::memory_order_relaxed);
+  // ★ 这里**绝不能** quit_.store(false)。
+  //
+  // 曾经的写法是"进 Loop 先清零退出标志"，看起来是"让本对象可重启"，实际上是丢唤醒：
+  //   Loop() 是在 **loop 线程**里执行的，而 Quit() 由**别的线程**（Channel::Stop / Server::Stop）
+  //   调用。两者之间存在真实窗口：线程已创建（std::thread 构造返回）、还没被调度到 Loop 的
+  //   第一行，此时 Quit() 已经 quit_=true 并 Wakeup()，随后 Loop() 一进来就把标志抹成 false
+  //   → 线程永远不退出 → Stop() 里的 join() 永久挂死（连接池/Channel 都已拆完，没有任何
+  //   东西能再叫醒它）。
+  //
+  //   实测（tests/test_e2e_echo 的 F 段：起 Channel → 调一次 → Stop → 重新建 Channel）：
+  //   加打印前 8 次运行挂 5 次；抓到的现场就是 "QUIT requested" 打印在 "START" 之前，
+  //   随后该线程 iter#1 打出 quit=0 并一直跑下去。改成"quit_ 只由构造函数置 false"后
+  //   连跑 20 次全过。
+  //
+  // 语义依据：EventLoop 与 Channel / ConnectionPool 一致 —— **停止不可重启**。
+  // 全树没有任何调用方对同一个 EventLoop 调用两次 Loop()（调用点只有 channel.cpp:348、
+  // server.cpp 的 io/metrics 线程，都是先 new 再起线程），所以这个清零从来没有生产者。
   loop_thread_id_ = std::this_thread::get_id();
   thread_bound_.store(true, std::memory_order_release);
 

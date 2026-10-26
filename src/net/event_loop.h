@@ -43,10 +43,24 @@ class EventLoop : private NonCopyable {
 
   // 启动循环，当前线程成为 loop 线程，本函数阻塞直到 Quit() 被调用。
   // 约束：只能调用一次；不可重入。
+  // **本对象生命周期内至多成功进入一次**，且 **Quit() 之后不可重启** —— 见 Quit() 的说明。
+  // 重复调用的行为分两种，都不抛错：
+  //   * 循环**仍在运行**时再调 → `running_` 的 CAS 拦下，打一行 ERROR 后立即返回；
+  //   * Loop 已返回后再调 → `quit_` 仍为 true，`while (!quit_)` 一进来就退出，等于空转一次。
   void Loop();
 
   // 请求退出循环（线程安全，可从任意线程调用）。
   // 语义：立即停止等待新事件，执行完当前一轮已就绪的回调后返回。
+  //
+  // ★ **Quit 是单向的、不可撤销的**：调用之后本对象不会再回到运行态，再次 Loop() 也不会
+  //   复位退出标志。这不是"没实现重启"，是**刻意**：
+  //   复位标志（进 Loop 先 `quit_ = false`）会丢唤醒 —— Loop() 在 loop 线程里跑，Quit()
+  //   由别的线程（Channel::Stop / Server::Stop）调，两者之间存在真实窗口：线程已创建但
+  //   还没被调度到 Loop 第一行，此时 Quit() 已置位并 Wakeup()，随后 Loop() 一进来把标志
+  //   抹平 → 线程永不退出 → Stop() 里的 join() **永久挂死**。
+  //   实测症状：test_e2e_echo 里"起 Channel → 调一次 → Stop → 重建"这一段，8 次挂 5 次；
+  //   现场是 "QUIT requested" 打印在 "START" 之前。改成单向后连跑 20 次全过。
+  //   需要"重启"就 new 一个新的 EventLoop（与 Channel / ConnectionPool 的语义一致）。
   void Quit();
 
   // 循环是否正在运行（Loop() 已进入且未返回）。线程安全。
