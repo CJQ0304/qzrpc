@@ -36,6 +36,18 @@
     the round if it does not say `source=cli(--conns N)`. "The parameter looks like it was
     passed in" is not evidence -- `-Threads 1,4` arriving as the single value 14 is.
 
+  WHY --max-retries 0 IS ALWAYS PASSED:
+    A benchmark answers "how much can we serve", not "how much can we salvage". With the
+    default retries (2), an `errors : 0` row can mean "zero requests failed" OR "every
+    failed request succeeded on the second attempt" -- and the table cannot tell you which.
+    The client prints its own counters for exactly this reason:
+      [client] retry_total=N failover_total=N late_total=N
+    This script requires that line, and FAILS the round when retry_total is not 0: with
+    --max-retries 0 a nonzero retry_total means the flag did not take effect, i.e. the row
+    is about to be labelled "0 errors" while it is not. `late_total` is recorded too --
+    a late response can only exist after a timeout, so a nonzero value means the p99 in
+    that row is a best case, not the latency.
+
   Also writes the machine profile into the output: a QPS number without the CPU model
   and core count is not reproducible, so it is not evidence. On a hybrid CPU (P-cores with
   SMT + E-cores without) the thread axis has TWO regimes, and a table that sweeps 1..32
@@ -253,12 +265,43 @@ function Get-BenchMetrics([string] $text) {
   return $result
 }
 
-function Get-Median([double[]] $values) {
-  if ($values.Count -eq 0) { return $null }
+# -1 is this script's "the client does not report this counter" marker; print it as n/a
+# rather than as a number, so a missing field can never be read as a healthy zero.
+function Format-Counter([int] $value) {
+  if ($value -lt 0) { return 'n/a' }
+  return [string]$value
+}
+
+function Get-Median([double[]] $values) {  if ($values.Count -eq 0) { return $null }
   $sorted = @($values | Sort-Object)
   $middle = [int][math]::Floor($sorted.Count / 2)
   if ($sorted.Count % 2 -eq 1) { return $sorted[$middle] }
   return ($sorted[$middle - 1] + $sorted[$middle]) / 2.0
+}
+
+# echo_client announces its semantic counters right before exiting, in EVERY mode:
+#   [client] retry_total=0 failover_total=0 late_total=0
+# Without them "errors : 0" is ambiguous -- it can mean "nothing failed" or "everything
+# that failed was retried successfully". The fields are captured separately because they
+# answer different questions: retry = a resend after the peer may already have seen the
+# request; failover = switched endpoint before sending a single byte; late = a response
+# that arrived after the caller had given up (so a timeout happened).
+#
+# late_total is OPTIONAL in the pattern on purpose: the counter set has already grown once
+# (late_total was added after retry/failover), and a parser that hard-requires the newest
+# field silently turns an older binary into "cannot prove retries were off". What must be
+# non-negotiable is retry_total -- that one decides whether the row may say `errors : 0`.
+function Get-ClientSemanticCounters([string] $text) {
+  $match = [regex]::Match($text,
+    '(?m)^\[client\]\s+retry_total=(\d+)\s+failover_total=(\d+)(?:\s+late_total=(\d+))?')
+  if (-not $match.Success) { return $null }
+  $late = -1  # -1 = the client did not report it
+  if ($match.Groups[3].Success) { $late = [int]$match.Groups[3].Value }
+  return New-Object psobject -Property @{
+    Retry    = [int]$match.Groups[1].Value
+    Failover = [int]$match.Groups[2].Value
+    Late     = $late
+  }
 }
 
 # echo_client announces where every auto-derivable knob came from, e.g.
@@ -317,7 +360,8 @@ try {
     Write-Step ("Warmup: {0} requests, threads=1, conns={1}" -f $Warmup, $warmConns)
     $warm = Invoke-ClientCaptured @('--servers', ("127.0.0.1:{0}" -f $Port),
                                     '--bench', "$Warmup", '1',
-                                    '--conns', "$warmConns")
+                                    '--conns', "$warmConns",
+                                    '--max-retries', '0')
     if ($warm.ExitCode -ne 0) {
       Write-Host $warm.Stdout.TrimEnd()
       Write-Host $warm.Stderr.TrimEnd()
@@ -345,12 +389,16 @@ try {
       $maxValues = @()
       $totalErrors = 0
       $totalRequests = 0
+      $retryTotal = 0
+      $failoverTotal = 0
+      $lateTotal = 0
       $connSource = ''
 
       for ($round = 1; $round -le $Rounds; $round++) {
         $run = Invoke-ClientCaptured @('--servers', ("127.0.0.1:{0}" -f $Port),
                                         '--bench', "$Requests", "$threadCount",
-                                        '--conns', "$connCount")
+                                        '--conns', "$connCount",
+                                        '--max-retries', '0')
         if ($run.ExitCode -ne 0) {
           Write-Host $run.Stdout.TrimEnd()
           Write-Host $run.Stderr.TrimEnd()
@@ -382,8 +430,30 @@ try {
           break
         }
         $connSource = $connsInfo.Source
-        Write-Host ("    threads={0} conns={1} round={2}/{3}  qps={4:N1}  p50={5}us  p99={6}us  errors={7}" -f `
-          $threadCount, $connCount, $round, $Rounds, $metrics.Qps, $metrics.P50, $metrics.P99, $metrics.Errors)
+        # "--max-retries 0" must be observable, not assumed: a nonzero retry_total means
+        # the row's `errors : 0` is a post-retry number, and a table that cannot tell those
+        # two apart is the same defect as a QPS row without its conns count.
+        $counters = Get-ClientSemanticCounters $run.Stdout
+        if ($null -eq $counters) {
+          Write-Host $run.Stdout.TrimEnd()
+          Write-Host '    (no [client] retry_total=... line -- cannot prove retries were off)'
+          $failed++
+          break
+        }
+        if ($counters.Retry -ne 0) {
+          Write-Host ("    retry_total={0} with --max-retries 0 -- the flag did not take effect, or the request failed and was retried anyway" -f $counters.Retry)
+          $failed++
+          break
+        }
+        $retryTotal += $counters.Retry
+        $failoverTotal += $counters.Failover
+        # -1 means "this build does not report late_total". Once one round says that, the
+        # row's late number is unknown for the whole point -- do not sum around it.
+        if ($counters.Late -lt 0) { $lateTotal = -1 }
+        elseif ($lateTotal -ge 0) { $lateTotal += $counters.Late }
+        Write-Host ("    threads={0} conns={1} round={2}/{3}  qps={4:N1}  p50={5}us  p99={6}us  errors={7}  retry={8} failover={9} late={10}" -f `
+          $threadCount, $connCount, $round, $Rounds, $metrics.Qps, $metrics.P50, $metrics.P99, $metrics.Errors,
+          $counters.Retry, $counters.Failover, (Format-Counter $counters.Late))
         $qpsValues += $metrics.Qps
         if ($null -ne $metrics.P50) { $p50Values += [double]$metrics.P50 }
         if ($null -ne $metrics.P99) { $p99Values += [double]$metrics.P99 }
@@ -405,6 +475,9 @@ try {
           Max      = (Get-Median $maxValues)
           Requests = $totalRequests
           Errors   = $totalErrors
+          Retry    = $retryTotal
+          Failover = $failoverTotal
+          Late     = $lateTotal
         }))
       }
     }
@@ -514,16 +587,17 @@ $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 # binary measured 24.1k and 43.1k in the same minute purely by changing conns.
 $noisy = New-Object System.Collections.ArrayList
 $lines = New-Object System.Collections.ArrayList
-[void]$lines.Add('| threads | conns | QPS (median) | QPS (min..max) | spread | p50 (us) | p99 (us) | max (us) | requests | errors |')
-[void]$lines.Add('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
+[void]$lines.Add('| threads | conns | QPS (median) | QPS (min..max) | spread | p50 (us) | p99 (us) | max (us) | requests | errors | retry | failover | late |')
+[void]$lines.Add('| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |')
 foreach ($row in $rows) {
   $spread = 0.0
   if ($row.QpsMed -gt 0) { $spread = ($row.QpsMax - $row.QpsMin) / $row.QpsMed }
   $spreadText = ('{0:N0}%' -f ($spread * 100))
   if ($spread -gt 0.30) { [void]$noisy.Add(("threads={0}/conns={1}" -f $row.Threads, $row.Conns)) }
-  [void]$lines.Add(("| {0} | {1} | {2:N0} | {3:N0}..{4:N0} | {5} | {6:N0} | {7:N0} | {8:N0} | {9} | {10} |" -f `
+  [void]$lines.Add(("| {0} | {1} | {2:N0} | {3:N0}..{4:N0} | {5} | {6:N0} | {7:N0} | {8:N0} | {9} | {10} | {11} | {12} | {13} |" -f `
     $row.Threads, $row.Conns, $row.QpsMed, $row.QpsMin, $row.QpsMax, $spreadText, `
-    $row.P50, $row.P99, $row.Max, $row.Requests, $row.Errors))
+    $row.P50, $row.P99, $row.Max, $row.Requests, $row.Errors, `
+    $row.Retry, $row.Failover, (Format-Counter $row.Late)))
 }
 
 Write-Host ''
@@ -546,6 +620,9 @@ Write-Host ("    os      : {0} {1}" -f $machine.OsCaption, $machine.OsVersion)
 Write-Host ("    source  : {0}" -f $machine.Source)
 Write-Host ("    topology: echo_server and echo_client are two processes on THIS host,")
 Write-Host  "              talking over loopback (127.0.0.1) - no network in between."
+Write-Host  "    shared  : both processes compete for the same cores, so these numbers are"
+Write-Host  "              END-TO-END JOINT throughput, NOT a server capacity ceiling."
+Write-Host  "              A real capacity number needs two machines."
 Write-Host ("    axis    : threads={0} x conns/endpoint={1} (conns is ALWAYS explicit)" -f `
   ($threadList -join ','), ($connsList -join ','))
 Write-Host ("    params  : requests/thread={0}, rounds={1} (median reported), warmup={2}" -f `
@@ -572,6 +649,11 @@ $document += ("- axis: threads={0} x conns/endpoint={1}" -f ($threadList -join '
 $document += ("- params: requests/thread={0}, rounds={1} (median reported), warmup={2}" -f `
   $Requests, $Rounds, $Warmup)
 $document += '- topology: client and server are two processes on the same host, over loopback.'
+$document += '- shared-cpu: both processes compete for the same cores, so these numbers are'
+$document += '  END-TO-END JOINT throughput, not a server capacity ceiling. A true capacity'
+$document += '  number needs two machines.'
+$document += '- retries: --max-retries 0 for every point, and retry_total must be 0 or the'
+$document += '  round fails -- so `errors` is never a post-retry number.'
 $document += '- connection: --conns is passed explicitly for every point and the client'
 $document += '  announcement line is verified (`source=cli(--conns N)`); a row whose actual'
 $document += '  conns differ from its label fails the run instead of being recorded.'

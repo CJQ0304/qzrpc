@@ -36,15 +36,18 @@
   passed, 0 tests failed out of 9" was seen exactly that way while 4 cases were missing.
   build.ps1 now also cross-checks tests\test_*.cpp against `ctest -N` and fails on a gap.
 
-  TRIAGE ORDER for "flaky timeout" / "test hangs with zero output" -- ENVIRONMENT FIRST,
-  CODE SECOND:
-    1. run the failing .exe directly, then immediately run it again;
-    2. if both pass, it was the first-execution antivirus scan (measured on this host:
-       a freshly linked or freshly copied exe took >70s and printed nothing at all --
-       not even main() -- then 0.9s once the scanner had seen it);
-    3. only after that, suspect a regression.
-  ctest TIMEOUT is 180s for this reason. A guard that trips on the healthy path (fresh
-  build directory -> ctest, which is what CI does every day) is noise, not a guard.
+  About the ctest TIMEOUT (180s): it is a pure guardrail, NOT a performance budget and
+  NOT an environment allowance. The whole suite finishes in under 5 seconds on this host,
+  so 180s can only ever fire on a real hang. Every case prints "== TestXxx" and flushes
+  before it runs, so a hang names itself in the last line before ctest's timer kills it.
+
+  The one "Timeout 60.03s" seen on this project was NOT an environment problem. It was a
+  lost wakeup in EventLoop::Loop: the loop thread wiped `quit_` on entry, erasing a Quit()
+  that had arrived in the window between thread creation and the first line of Loop() --
+  the thread then never exited and join() hung forever (fixed in 12617e8, locked by
+  tests/test_event_loop.cpp). The lesson is worth keeping: a wrong environment attribution
+  ("it is just the antivirus / just rerun it") is exactly how a real concurrency bug
+  survives a retry. Rerun-to-green proves nothing -- it would also have "worked" here.
 
   DO NOT PIPE THIS SCRIPT WITHOUT DRAINING IT. Measured the hard way: running
     powershell -File scripts\ci.ps1 *>&1 | Tee-Object -FilePath build\ci.log

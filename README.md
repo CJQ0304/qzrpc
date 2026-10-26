@@ -184,7 +184,7 @@ ctest --test-dir build --output-on-failure
 - 每个 `test_*.cpp` 编译成独立可执行 + 独立 ctest 用例：一个用例崩了不会拖垮其余用例。
 - CI 建议额外打开 `-DQZRPC_WERROR=ON`，把"零警告"变成构建的硬门槛。
 
-当前 13 个 ctest 用例（括号里是断言数，`ctest` 只报通过/失败，断言数要看用例自己的输出）：
+当前 14 个 ctest 用例（括号里是断言数，`ctest` 只报通过/失败，断言数要看用例自己的输出）：
 
 | 用例 | 断言 | 覆盖什么 | 依赖外部工具 |
 | --- | ---: | --- | --- |
@@ -195,20 +195,90 @@ ctest --test-dir build --output-on-failure
 | `test_frame_metadata` | 510 | 帧头逐字节、flags 真值表、metadata TLV 与扩展键边界 | 无 |
 | `test_service_registry` | 95 | 方法目录、method_id 重算比对（L2）、冲突与幂等 | 无 |
 | `test_load_balancer` | 7460 | 轮询/随机/一致性哈希：分发均匀性（200 线程并发）、重试换实例、短 key 分散、并发刷新 | 无 |
-| `test_thread_pool` | 796 | 有界队列拒绝、调用者运行、Stop 排空/丢弃、计数一致性 | 无 |
+| `test_thread_pool` | 796 | 有界队列拒绝、调用者运行、Stop 排空/丢弃、计数一致性、**任务抛异常不拖垮进程** | 无 |
 | `test_timer_queue` | 124 | 一次性/周期性定时器、惰性取消、回调内重入、到期顺序 | 无 |
 | `test_dispatcher` | 111 | 路由注册与冲突、未知 method_id、截断 payload、错误码透传、deadline 判定 | 无 |
+| `test_event_loop` | 47 | **`Quit()` 早于 `Loop()` 调度必须能停**（曾有 `join()` 永久挂死）、停止不可重启、退出前排空任务队列、`RunInLoop` 内联 vs `QueueInLoop` 延迟 | 无 |
 | `test_e2e_echo` | 38 | **进程内真实 Server + Channel 往返**：并发不串号、超时与迟到响应、错误码透传、300 KiB 载荷 | 无（端口用 0） |
 | `codegen_python` | 180 | 生成器：AST、语义校验、golden 输出、method_id 一致性 | 无（标准库 `unittest`） |
 | `interop_protobuf` | 3 | 本框架编出的字节能被**官方 protobuf** 解析（13 字段逐值比对） | `protoc` + `google.protobuf`，缺任一个自动 `***Skipped`（退出码 2） |
 
-合计：**C++ 9,995 条断言**（11 个可执行）+ 生成器 180 + 互通 3。断言数不是多多益善——
+合计：**C++ 10,042 条断言**（12 个可执行）+ 生成器 180 + 互通 3。断言数不是多多益善——
 `test_load_balancer` 那 7,460 条里绝大部分来自"200 次循环各断言一次"这类分布检查，
 它们存在的意义是让"偶发偏差"变成必现失败，而不是凑数。
+
+`test_event_loop` 的 47 条数不出它的价值：它守的是**进程级**缺陷。`Quit()` 早于 `Loop()` 到达时，
+旧实现会抹掉退出标志、让 `join()` 永久挂死；在 e2e 里这条是偶发红（8 次挂 5 次），
+只有钉成"`Quit()` 一定发生在 `Loop()` 之前"才是确定性用例。它的看门狗还让失败有指纹：
+`kLateQuit`（补一次 Quit 才停 = 标志被抹掉）与 `kStuck`（彻底叫不醒），
+而不是 180 秒后一句 `Timeout`。
 
 `interop_protobuf` 是唯一可能被跳过的用例，跳过时 ctest 会把它列进 `The following tests were not run`，
 **不要**把 `***Skipped` 读成通过——这也是它用退出码 2 + `SKIP_RETURN_CODE` 而不是直接返回 0 的原因。
 `QZRPC_REQUIRE_INTEROP=ON` 可以把"缺工具就跳过"变成"缺工具就 configure 失败"，用于发版前的强校验。
+
+---
+
+## 可复现性
+
+「clone 下来就能跑」这句话在本项目里是**测过的**，不是承诺。
+
+```bash
+git clone . /tmp/qzrpc-verify            # 全新目录：不带 build*、不带 .scratch/、不带工作区任何改动
+cd /tmp/qzrpc-verify && scripts\ci.ps1   # 从零 configure + build + ctest + 三道 codegen 闸门
+```
+
+`ci.ps1` 的原始输出（2026-10-24，验证对象 **`56c9435`**，宿主 i9-14900HX / 32 逻辑核 / Win11 26200）：
+
+```
+==> Stage 1/4: build + ctest
+==> Configuring (Release) -> D:\qzrpc_clone_final\build
+==> CI gates enabled: /WX + codegen compile gate
+-- Configuring done (2.6s)
+[1/76] ... [76/76]
+    ctest knows 12 C++ case(s), tests\ has 12 test_*.cpp
+==> Running ctest
+ 1/14 Test  #1: test_endian ......................   Passed    0.05 sec
+ 5/14 Test  #5: test_thread_pool .................   Passed    0.25 sec
+ 6/14 Test  #6: test_load_balancer ...............   Passed    0.07 sec
+11/14 Test #11: test_event_loop ..................   Passed    0.07 sec
+12/14 Test #12: test_e2e_echo ....................   Passed    0.77 sec
+14/14 Test #14: interop_protobuf .................   Passed    0.29 sec
+100% tests passed, 0 tests failed out of 14
+Total Test time (real) =   2.48 sec
+    build time: 9.75s
+==> Stage 2/4: qzcodegen --check on idl/*.qz
+qzcodegen: 1 file(s) checked, protocol v1, 0 warning(s)
+==> Stage 3/4: generated/ is in sync with idl/
+    generated/ matches the generator output
+==> Stage 4/4: compile gate [idl]       1 TU(s) compiled in 0.47s
+==> Stage 4/4: compile gate [fixtures]  1 TU(s) compiled in 0.75s
+==> CI OK
+CI_EXIT=0
+```
+
+| 检查项 | 结果 |
+| --- | --- |
+| 提交态文件数 | **139**（`git ls-files \| wc -l`） |
+| 克隆工作区 | `git status --short` → **0 行**，构建跑完之后再查仍是 0 行（构建不往工作区丢文件） |
+| 编译 | **76 个 TU**，`/utf-8 /W4 /WX /permissive-`，零告警，9.75s |
+| ctest | **14/14**（12 个 C++ 用例 + `codegen_python` + `interop_protobuf`），2.48s |
+| `generated/` | 与现场重建**逐字节相同**（SHA256 比对）；前提是 `.gitattributes` 里的 `eol=lf` |
+| 四阶段 | 全绿，`CI_EXIT=0`，端到端 19.3s |
+
+这一步不是仪式，它抓到过一个真问题：**提交态与团队机器上编的代码不是同一份**。当时工作区
+6 个 `M` 的修复（`%d` 收 `size_t`、线程池异常未收口、轮转算术、`Quit` 早于 `Loop`）让本地全绿，
+而克隆出来的仓库 Stage 1 直接红：编译失败一处、`test_thread_pool` 以 `0xC0000409` 打死进程、
+`test_load_balancer` 报 `differed == 100 (actual=0)`。
+**「本地全绿」与「仓库全绿」是两个判据**，后者才是别人拿到的东西——所以「任何修复必须落地为
+一次提交」是硬规矩（见「设计约定」第 4 条）。
+
+已验证范围与**未**验证范围，分开写：
+
+- **已验证**：Windows + MSVC 19.5x，从干净克隆到 `ci.ps1` 四阶段全绿（本仓库的默认路径）。
+- **未验证**：POSIX 路径（`scripts/build.sh`、`scripts/ci.sh`）—— 代码已写、经逐条评审，
+  但**未在本环境的任何 gcc / clang 上编译过**（本机只有 MSVC）。**跨平台不是本项目的验证范围**，
+  具体到哪几条已知会被绕过、哪几条没验证，见下方「已知边界」第一条。
 
 ---
 
@@ -231,10 +301,16 @@ ctest --test-dir build --output-on-failure
   成 1 时测的（口径是"单连接往返"却当成容量在说）；② 同一台机器、相隔两分钟，1 线程 QPS
   实测 19,178 与 4,657，差 4 倍——当时有别人的构建和 ctest 在跑。"加线程 QPS 不升反降"这个
   旧结论主要来自 ①，不是框架不伸缩。
-
-**噪声必须单独报，不能靠中位数吸收。** 取中位数本身不构成保护：机器持续噪声时三轮一样慢，
-中位数照样好看。所以每个点都打印 `spread = (max-min)/median`，超过 30% 直接黄字告警并写进
-`bench.md`：那些行只能读作"大概这个量级"，不能进表格。
+- **同机压测**：`echo_server` 与 `echo_client` 是同一颗 CPU 上的两个进程，在抢同一批核。
+  所以表里的数值是**端到端联合吞吐**，**不是服务端容量上限**；服务端容量的真实数字需要在两台
+  机器上测。不写这句，四万会被读成"服务端只能跑四万"——那是对我们自己不利的误读。
+- **重试必须被关掉**：每一点都传 `--max-retries 0`，并要求客户端报出的 `retry_total` 为 0，
+  否则这一轮判失败。原因很直接：带默认重试时，`errors : 0` 可能是"一次都没失败"，也可能是
+  "失败的都被第二次救回来了"，而表上看不出区别。表里因此还有 `retry / failover / late` 三列，
+  `late > 0` 意味着这一行已经发生过超时，它的 p99 是乐观值。
+- **噪声必须单独报，不能靠中位数吸收。** 取中位数本身不构成保护：机器持续噪声时三轮一样慢，
+  中位数照样好看。所以每个点都打印 `spread = (max-min)/median`，超过 30% 直接黄字告警并写进
+  `bench.md`：那些行只能读作"大概这个量级"，不能进表格。
 
 机器画像（`bench.ps1` 每次运行都会打印同样几行，换机器请一并带上）：
 
@@ -242,8 +318,9 @@ ctest --test-dir build --output-on-failure
 cpu     : Intel(R) Core(TM) i9-14900HX
 cores   : 24 physical / 32 logical
 memory  : 15.7 GB
-os      : Windows 10.0.26200 (build 26200)
+os      : Microsoft Windows 11 10.0.26200 (build 26200)
 topology: echo_server 与 echo_client 是同机两个进程，走 loopback，中间没有网络
+shared  : 两个进程抢同一批核 → 端到端联合吞吐，不是服务端容量上限
 ```
 
 这台 CPU 是**混合架构**：8 个 P 核（带超线程，16 线程）+ 16 个 E 核（无超线程，16 线程）。
@@ -298,6 +375,51 @@ topology: echo_server 与 echo_client 是同机两个进程，走 loopback，中
   `configure` 之后才存在的文件，ninja 不会为它重跑 configure，于是"全绿"其实少跑了 4 条、
   8035 条断言）。
 
+**4. 任何修复必须落地为一次提交。**
+
+只存在于工作区的修复，**等于不存在**：它会在克隆里、在 CI 里、在任何人手里消失，而在作者机器上
+永远"通过"。干净克隆验收是**检测**，提交习惯是**预防**；两者都要，但后者不该靠检查来保证。
+
+事故：`git status` 里 6 个 `M src/**` 曾是"团队机器上全部测试都过"的唯一原因，而克隆出来的
+仓库 Stage 1 直接红（编译失败 + `0xC0000409` + `differed=0`）。同一天里"绿"出现了两种含义，
+而交付物只有一种。
+
+**5. 挂死型缺陷的用例不能只靠 ctest 的 `TIMEOUT` 报红。**
+
+`std::thread t(...); t.join();` 在回归时永不返回，ctest 在 180 秒后只给一句 `Timeout`——
+**前面所有断言结果全丢**，你也永远不知道"它是在哪一步挂的"。要在用例内部设看门狗，
+并让"怎么挂的"本身成为可断言的输出。
+
+做法（`tests/test_event_loop.cpp`）：等 10s → 超时后**再 `Quit()` 一次**（回归形态下这一刀才叫得醒，
+因为标志是被 `Loop()` 抹掉的）→ 仍不回才 detach。于是同一个回归有两种**可分辨指纹**：
+`kLateQuit`（补第二刀才停 = 标志被抹掉）与 `kStuck`（彻底叫不醒），都判失败，但看日志就知道
+是哪一种。同理，**成对用例**比单独的用例强：`test_event_loop` 的 A（`Quit` 早到也能停）与
+G（停止后不能重启）互相牵制，任何一半被单方面改掉，另一半会红。
+
+---
+
+## CI 红了先看这里
+
+`scripts/ci.ps1` 的四个阶段各自的失败指纹。先把"偶发"这个词从你的判断里去掉：**一次红就是一次红**，
+"重跑就绿"对任何原因都成立，所以它什么都不能证明（下面第 3 行就是被这个想法坑过的实例）。
+
+| 现象 | 第一个动作 | 已知的真凶 |
+| --- | --- | --- |
+| `error C2220: 以下警告被视为错误` | `git status` | 修复只在**工作区**没提交（本仓库实测的第一号原因）；其次才是真有新警告 |
+| 用例 `Exit code 0xc0000409`、几秒即死、**零输出** | 看是不是线程函数里抛了异常 | `std::terminate` → 进程 fail-fast。`0xC0000409` 是它的指纹 |
+| `Timeout 180s`，或某用例跑很久后被杀 | 看挂住前最后一行 `== TestXxx` 是谁 | 真挂死。**不要**归因到"重跑一次就好"：本项目唯一一次 60s 超时的真因是 `EventLoop::Loop()` 抹掉早到的 `Quit()` → `join()` 永久挂死，不是环境 |
+| ctest 全绿但**条数变少** | 看 `ctest knows N / tests\ has M` 这行 | 只 `cmake --build` 没重新 configure；`build.ps1` 现在直接判红 |
+| Stage 2 `codegen --check` 拒绝 | `codegen/tests` 里对应的用例 | IDL 语法或语义非法（`--check` 不落盘） |
+| Stage 3 `content differs: echo.qz.h` | 重新生成一次并 `git diff` | 改了 `idl/` 或生成器却没重新生成；或工作区被换成 CRLF（`git config core.autocrlf`） |
+| Stage 3 文件数/文件名不符 | `ls generated/`（**只应有两个文件**） | 有人把中间产物或临时文件落进了 `generated/` |
+| Stage 4 `generated source does not compile` | 看报的 TU 名 | `idl` → 主 IDL 的字段形态；`fixtures` → `kitchen_sink.qz` 覆盖的边界形态（11 标量 × 4 label、packed、嵌套、INT64_MIN） |
+
+另外两条与环境相关、**不报错只会卡住**的：
+
+- **不要把 `ci.ps1` 接进不排空的管道**：`... | Tee-Object` 会让 `cl.exe` 在 `/showIncludes` 输出写满
+  4KB 管道后阻塞（实测卡 10 分钟、CPU 累计 0.1s）。直接 `*>` 落文件，或让消费端持续读。
+- **不要在别人构建/测试时跑 bench**：QPS 会差 4 倍，而中位数吸收不掉（见「性能」末尾）。
+
 ---
 
 ## 已知边界
@@ -315,10 +437,11 @@ topology: echo_server 与 echo_client 是同机两个进程，走 loopback，中
 - `bench.ps1` 的数字是 loopback 上的相对比较基准，不能当跨网络性能估计；输出里的 `spread` 列
   与 `!! noisy` 告警要一起读——机器被别的任务占着时，中位数也会失真。**QPS 只在独占机器的
   窗口里测**，混在构建/测试里跑出来的数一个都不要引用。
-- 这台构建机上，**刚链接出来（或刚被复制成新名字）的 exe 第一次执行会被实时杀毒扫描挡住**：
-  实测 `>70s` 且**零输出**（连 `main()` 都没进），同一文件一分钟后跑 `0.9s` 通过。所以 ctest 的
-  `TIMEOUT` 是 **180s**——它的职责是抓"真挂住"，不是抓"慢"。遇到偶发超时/零输出的排查顺序
-  是**先环境后代码**：直接跑一次 exe，再立刻跑一次；两次都过就是扫描，不是回归。
+- ctest 的 `TIMEOUT` 是 **180s**，它是**护栏**：整套用例正常 5 秒内跑完，所以这个数只在真挂死时
+  才会触发。曾经把它设成 60s、并解释为"首次执行被杀软扫描挡住"—— **那个归因是错的，已撤回**。
+  真因是 `EventLoop::Loop()` 抹掉早到的 `Quit()`（见 `tests/test_event_loop.cpp` 的文件头）。
+  留在这里的一句话：**错误的环境归因是并发 bug 熬过一次重试的方式**；"重跑一次就好了"对任何
+  原因都成立，因此它证明不了任何事。要证明，就像 `test_event_loop` 那样把窗口**构造**出来。
 
 ---
 
