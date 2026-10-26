@@ -203,22 +203,58 @@ if ($mismatch -ne '') {
 }
 Write-Host "    generated/ matches the generator output"
 
+# Run a native command and hand back everything it wrote on BOTH streams.
+#
+# Why this exists: the one warning this project tolerates (the explicit method_id pin in
+# kitchen_sink.qz) is printed by the PYTHON generator on **stderr**, and PowerShell 5.1
+# turns native stderr into ErrorRecord objects. An assertion that only looked at stdout
+# would never see it -- the warning would stay visible to a human reading the log and to
+# nothing else, which is exactly the state we were in.
+function Invoke-Captured([string] $exe, [string[]] $arguments) {
+  # This script sets $ErrorActionPreference = 'Stop'. Under that setting a native command
+  # writing to stderr does not merely produce an ErrorRecord -- it THROWS, so the warning
+  # we are trying to count would abort the gate instead of being captured. Scope the
+  # preference down to the call and restore it.
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $lines = @(& $exe @arguments *>&1 | ForEach-Object { [string]$_ })
+    $code = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previous
+  }
+  return New-Object psobject -Property @{ ExitCode = $code; Lines = $lines }
+}
+
 # ---------------------------------------------------------------------------
 # 4. Compile gate: every generated TU must compile with /W4 /WX
+#
+# $expectWarnings / $expectWarningPattern make tolerated warnings EXPLICIT:
+#   * exactly that many warnings may appear;
+#   * each one must match the pattern.
+# Anything else is red. Disabling the warning (/wd) or deleting the fixture would also
+# make the log quiet -- and would hide the NEXT warning in that file forever. An expected
+# warning has to be declared and counted, not tolerated as background noise.
 # ---------------------------------------------------------------------------
-function Invoke-CompileGate([string] $label, [string] $inputPattern) {
+function Invoke-CompileGate([string] $label, [string] $inputPattern,
+                             [int] $expectWarnings, [string] $expectWarningPattern) {
   Write-Step "Stage 4/4: compile gate [$label]"
   $outDir = Join-Path $ciDir $label
   $objDir = Join-Path $outDir 'obj'
   & $cmake -E make_directory $objDir | Out-Null
 
+  $transcript = @()
   Push-Location $rootDir
   try {
-    & $cmake -E env "PYTHONPATH=$codegenDir" $python -m qzcodegen `
-        --input $inputPattern --out $outDir --cpp
-    if ($LASTEXITCODE -ne 0) { Stop-WithError "codegen failed for $inputPattern" }
+    $generate = Invoke-Captured $cmake @('-E', 'env', "PYTHONPATH=$codegenDir", $python,
+        '-m', 'qzcodegen', '--input', $inputPattern, '--out', $outDir, '--cpp')
   } finally {
     Pop-Location
+  }
+  $transcript += $generate.Lines
+  if ($generate.ExitCode -ne 0) {
+    $transcript | ForEach-Object { Write-Host $_ }
+    Stop-WithError "codegen failed for $inputPattern"
   }
 
   $sources = @(Get-ChildItem -LiteralPath $outDir -Filter *.cpp -File)
@@ -229,21 +265,48 @@ function Invoke-CompileGate([string] $label, [string] $inputPattern) {
     # /Fd is NOT optional here: without it cl writes vc140.pdb into the CURRENT directory,
     # which is the repo root (Push-Location above) -- every CI run would drop a stray
     # binary artifact next to CMakeLists.txt. Same reason /Fo points into $objDir.
-    & $cl /nologo /c /std:c++17 /utf-8 /W4 /WX /permissive- /EHsc /MD `
-        /I (Join-Path $rootDir 'src') /I $outDir `
-        /Fd"$objDir\vc.pdb" /Fo"$objDir\" $source.FullName
-    if ($LASTEXITCODE -ne 0) {
+    $compile = Invoke-Captured $cl @('/nologo', '/c', '/std:c++17', '/utf-8', '/W4', '/WX',
+        '/permissive-', '/EHsc', '/MD',
+        '/I', (Join-Path $rootDir 'src'), '/I', $outDir,
+        "/Fd$objDir\vc.pdb", "/Fo$objDir\", $source.FullName)
+    $transcript += $compile.Lines
+    if ($compile.ExitCode -ne 0) {
+      $transcript | ForEach-Object { Write-Host $_ }
       Stop-WithError "generated source does not compile: $($source.Name)"
     }
   }
   $stopwatch.Stop()
-  Write-Host ("    {0} TU(s) compiled in {1:N2}s" -f $sources.Count, $stopwatch.Elapsed.TotalSeconds)
+
+  # Replay what was captured: the log must still show what actually ran.
+  $transcript | ForEach-Object { Write-Host $_ }
+
+  # The negative lookahead matters: qzcodegen ends with a summary line
+  # "2 file(s) generated, 2 updated, 0 warning(s)", which contains the word "warning" and
+  # would otherwise be counted as one. Caught by running the gate, not by reading it.
+  $warnings = @($transcript | Where-Object { $_ -match '(?i)\bwarning\b(?!\(s\))' })
+  if ($warnings.Count -ne $expectWarnings) {
+    $detail = ("compile gate [{0}]: expected exactly {1} warning(s), saw {2}. " -f `
+        $label, $expectWarnings, $warnings.Count)
+    $detail += "A new warning is a regression, not noise -- fix it, or declare it here with a pattern."
+    Stop-WithError $detail
+  }
+  foreach ($warning in $warnings) {
+    if ($warning -notmatch $expectWarningPattern) {
+      Stop-WithError ("compile gate [{0}]: undeclared warning (does not match '{1}'): {2}" -f `
+          $label, $expectWarningPattern, $warning)
+    }
+  }
+
+  Write-Host ("    {0} TU(s) compiled in {1:N2}s, {2} declared warning(s)" -f `
+      $sources.Count, $stopwatch.Elapsed.TotalSeconds, $warnings.Count)
   $script:tuCompiled += $sources.Count
 }
 
 $script:tuCompiled = 0
-Invoke-CompileGate 'idl' 'idl/*.qz'
-Invoke-CompileGate 'fixtures' 'codegen/tests/fixtures/*.qz'
+Invoke-CompileGate 'idl' 'idl/*.qz' 0 ''
+# kitchen_sink.qz pins one method_id on purpose; the generator warns about it. Exactly one
+# warning, and it must be that one.
+Invoke-CompileGate 'fixtures' 'codegen/tests/fixtures/*.qz' 1 'explicit method_id'
 
 # ---------------------------------------------------------------------------
 # Summary
