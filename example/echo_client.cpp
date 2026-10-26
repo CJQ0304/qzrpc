@@ -629,6 +629,17 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(retry_total),
                 static_cast<unsigned long long>(failover_total),
                 static_cast<unsigned long long>(late_total));
+
+    // 借连接耗时：排队（线程抢不到池位）与服务时间变慢这两种原因，在 e2e 上长得一样，
+    // 但在这个直方图上完全不同 —— 排队会让它同步变大，服务时间变慢则它基本不动。
+    // 注意只报 mean/max/n，不报分位：直方图是对数分桶（2^i），Percentile() 返回桶上界，
+    // p99 只可能落在 511/1023/2047… 这类格子值上，用它做比值判据是自欺。
+    // n 必须打：metrics 没开时这个直方图不会被 Observe，n=0 就说明这一列不可用。
+    qzrpc::Histogram* acquire_us = registry.GetHistogram("qzrpc_client_pool_acquire_us");
+    std::printf("[client] pool_acquire_us : mean=%llu max=%llu n=%llu\n",
+                static_cast<unsigned long long>(acquire_us->MeanUs()),
+                static_cast<unsigned long long>(acquire_us->max_us()),
+                static_cast<unsigned long long>(acquire_us->count()));
   }
 
   channel.Stop();
