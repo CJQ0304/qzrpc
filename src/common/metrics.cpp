@@ -318,8 +318,23 @@ std::string MetricsRegistry::DumpJson() const {
 
 void MetricsRegistry::ResetAll() {
   std::lock_guard<std::mutex> lock(mutex_);
-  counters_.clear();
-  histograms_.clear();
+  // ★ 不能 counters_.clear() / histograms_.clear()。
+  //
+  // GetCounter/GetHistogram 的契约是"返回的指针**永不失效**"（见 metrics.h 的
+  // MetricsRegistry 类注释），而 Server::Impl::RegisterMetricPointers 与
+  // Channel::Impl 都按这个契约在启动时把裸 Counter* / Histogram* 缓存进成员，
+  // 之后的每一次 Inc / Observe 都直接用缓存指针。clear() 会析构对象，
+  // 缓存里全部变成悬垂指针 —— 下一次 Inc 就是 use-after-free。
+  //
+  // 更糟的是它只在"测试里 ResetAll 之后还有 Server/Channel 活着"时炸，
+  // 而单测恰恰是这个用法（一个进程里连跑多个用例，每个用例起一套 Server）。
+  // 正确做法：保留对象、只把值归零，这样 ResetAll 之后所有既有句柄继续可用。
+  for (auto& kv : counters_) {
+    if (kv.second) kv.second->Reset();
+  }
+  for (auto& kv : histograms_) {
+    if (kv.second) kv.second->Reset();
+  }
 }
 
 }  // namespace qzrpc

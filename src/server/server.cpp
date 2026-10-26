@@ -112,10 +112,9 @@ constexpr int kRegistryWaitSliceMs = 100;
 // 否则会出现"我们以为还有 30s，注册中心 15s 就把我们摘了"的错位。
 constexpr std::uint32_t kRegistryLeaseTtlMs = 15000;
 
-// 单次 Read 事件里最多解多少帧就主动让出？（0 表示不限制）
-// 说明：Connection 用的是水平触发，message_cb 返回后如果 input_ 里还有残留字节，
-// 不会再有新的可读事件（数据已经在用户态缓冲里），因此这里**必须**一直解到 kNeedMore，
-// 否则会静默卡住连接。防饿死的杠杆用"队列满则暂停读"，不是在这里截断。
+// /metrics 的 HTTP 请求头（含结尾空行）的**字节**上限，超了直接 ForceClose。
+// 这是无鉴权端点，不能让任何人用半截请求头把连接与缓冲长期占住（对应 B4/C4 两条已知问题）。
+// 注意单位是字节不是帧数 —— 单次 Read 解多少帧的说明见 HandleMessage 里的循环。
 constexpr std::size_t kMaxMetricsHttpRequestBytes = 8192;
 
 // /metrics 端点的**并发连接上限**（独立于 max_connections）。
@@ -221,8 +220,36 @@ struct Server::Impl {
   std::atomic<std::uint16_t> listen_port{0};
 
   // 自适应拒绝的滑动窗口（用 sum/count 而不是直方图：累计直方图无法反映"恢复"）
-  std::atomic<std::uint64_t> win_wait_sum_us{0};
-  std::atomic<std::uint64_t> win_wait_count{0};
+  //
+  // ★ 为什么"样本数"和"等待微秒和"打成**同一个 64 位原子**：
+  //   分两个原子就要两次 exchange 才能取走一个窗口，而两次之间是真实窗口边界：
+  //   某个 worker 若恰好在两次 exchange 之间落盘，它的 sum 计入旧窗口、count 计入新窗口，
+  //   于是新窗口 count 偏大、均值偏低 —— 而拒绝率正是被这个均值驱动的，
+  //   结果是"该升的时候反而降"。打包后取窗口 = **一次 exchange**，边界天然一致。
+  //
+  //   编码：高 32 位 = 样本数；低 32 位 = Σ waited_us >> 10（"千分之一微秒"的整千倍，
+  //   即 1024us 一个刻度）。
+  //     * count 放高位只是为了日志/调试时好读，exchange 是整体清零，位置不影响语义；
+  //     * sum 必须 >> 10：低 32 位存不下"窗口内微秒总和"的极端值（4.29e9us ≈ 71 分钟），
+  //       缩到千微秒后 32 位可表示约 71 分钟/窗口，实际打不满；
+  //     * 精度代价：每个样本最多少算 1023us，均值误差 = 1023/count us。判定阈值是
+  //       fast_reject_threshold_ms（默认 20ms = 20000us），count 上百时误差 < 5us，
+  //       不影响"升/降"这个二值决策。**不要**为了省这点误差改成浮点打包：
+  //       fetch_add 必须是整数原子操作才能无锁。
+  std::atomic<std::uint64_t> win_wait_packed{0};
+
+  // 打包/解包（避免两处各写一遍移位，写错了很难发现）。
+  static std::uint64_t PackWaitSample(std::uint64_t waited_us) noexcept {
+    const std::uint64_t kus = waited_us >> 10;  // 千微秒
+    // 单个样本的理论上限：即使 waited 是 4 秒也只有 ~4000，永远不会顶到 32 位；
+    // 这里仍然夹一下，防的是"有人把 waited_us 传成了别的时间单位"。
+    const std::uint64_t clamped = kus > 0xFFFFFFFFULL ? 0xFFFFFFFFULL : kus;
+    return (std::uint64_t{1} << 32) | clamped;
+  }
+  static std::uint64_t UnpackCount(std::uint64_t packed) noexcept { return packed >> 32; }
+  static std::uint64_t UnpackSumUs(std::uint64_t packed) noexcept {
+    return (packed & 0xFFFFFFFFULL) << 10;
+  }
 
   std::mutex run_mutex;
   std::condition_variable run_cv;
@@ -515,6 +542,11 @@ void Server::Impl::AttachConnectionInLoop(IoWorker* worker, int fd,
 
 void Server::Impl::HandleMessage(IoWorker* worker, const std::shared_ptr<net::Connection>& conn,
                                  Buffer* input) {
+  // 单次 Read 事件里最多解多少帧？（不设上限，一直解到 kNeedMore 为止）
+  // 说明：Connection 用的是水平触发，message_cb 返回后如果 input_ 里还有残留字节，
+  // 不会再有新的可读事件（数据已经在用户态缓冲里），因此这里**必须**一直解到 kNeedMore，
+  // 否则会静默卡住连接。防饿死的杠杆用"队列满则暂停读"（见 ConnState::read_paused），
+  // 不是在这里截断帧数。
   for (;;) {
     protocol::Frame frame;
     std::string err;
@@ -615,6 +647,17 @@ void Server::Impl::ReplyErrorInLoop(const std::shared_ptr<net::Connection>& conn
   conn->Send(out.Peek(), out.ReadableBytes());
   if (m_response_total != nullptr) m_response_total->Inc();
   if (m_error_total != nullptr) m_error_total->Inc();
+
+  // keep_alive=0 在**错误响应**上同样必须断开。四个错误入口（请求帧 status!=0 的
+  // kInvalidArgument、停机中的 kServiceUnavailable、自适应限流的 kOverload、队列满的
+  // kOverload）全都走这里；漏掉它会让"明确的失败"变成"客户端等 FIN 超时"：
+  // 线协议是给第三方实现看的，任何按契约发 keep_alive=0 的客户端都会收到完整错误响应、
+  // 然后等 FIN 等到自己超时 → 拿到 kTimeout → 非幂等调用按矩阵**不重试**。
+  // 这是 B5 的同族缺陷：当初只修了成功路径与单向路径，没人问"还有没有别的出口也发响应"。
+  //
+  // 用 Shutdown() 不用 ForceClose()：刚入队的错误响应必须排空，ForceClose 会让客户端
+  // 只拿到 RST（这一行上面的 Encode 失败分支才是 ForceClose，那里没有"排空"可言）。
+  if (!keep_alive) conn->Shutdown();
 }
 
 bool Server::Impl::ShouldReject() const {
@@ -644,8 +687,7 @@ void Server::Impl::HandleRequestInWorker(std::shared_ptr<net::Connection> conn,
   const std::uint64_t waited_us = begin_us > recv_us ? begin_us - recv_us : 0;
 
   if (m_queue_wait != nullptr) m_queue_wait->Observe(waited_us);
-  win_wait_sum_us.fetch_add(waited_us, std::memory_order_relaxed);
-  win_wait_count.fetch_add(1, std::memory_order_relaxed);
+  win_wait_packed.fetch_add(PackWaitSample(waited_us), std::memory_order_relaxed);
 
   Status status = Status::Ok();
   std::string out_payload;
@@ -904,8 +946,10 @@ void Server::Impl::AdjustRejectRate() {
     reject_rate.store(0, std::memory_order_relaxed);
     return;
   }
-  const std::uint64_t count = win_wait_count.exchange(0, std::memory_order_relaxed);
-  const std::uint64_t sum = win_wait_sum_us.exchange(0, std::memory_order_relaxed);
+  // 一次 exchange 取走整个窗口（见 win_wait_packed 的注释：分两次会串窗口）。
+  const std::uint64_t packed = win_wait_packed.exchange(0, std::memory_order_relaxed);
+  const std::uint64_t count = UnpackCount(packed);
+  const std::uint64_t sum = UnpackSumUs(packed);
   const int step = std::max(1, options.fast_reject_adjust_rate);
   const std::uint64_t threshold_us =
       static_cast<std::uint64_t>(std::max(0, options.fast_reject_threshold_ms)) * 1000ULL;
@@ -1102,8 +1146,21 @@ void Server::Impl::JoinThreads() {
 void Server::Impl::MetricsConnectionInLoop(const std::shared_ptr<net::Connection>& conn) {
   const int fd = conn->fd();
   auto request = std::make_shared<std::string>();
-  conn->SetMessageCallback([this, request](const std::shared_ptr<net::Connection>& c,
-                                           Buffer* input) {
+  // "已回过包"闸门。本端点的语义固定为「一次请求 → 一次响应 → 关连接」，
+  // 但 message_cb 是**按数据到达**触发的：对端在 `\r\n\r\n` 之后再发一段字节
+  // （keep-alive 复用、扫描器、或者干脆是另一个请求）就会第二次进回调，
+  // 于是会在同一个 fd 上发出**第二份 HTTP 响应** —— 抓取端会把第二份当成
+  // 下一个请求的响应，症状是"指标串位/解析失败"，且极难归因到服务端。
+  // 回落成本只是一个 bool，所以在冻结前补上。
+  auto responded = std::make_shared<bool>(false);
+  conn->SetMessageCallback([this, request, responded](const std::shared_ptr<net::Connection>& c,
+                                                     Buffer* input) {
+    if (*responded) {
+      // 已经回过包：后续字节直接丢弃（不解析、不回包、也不 ForceClose ——
+      // WriteMetricsResponse 里已经 Shutdown()，让输出缓冲自然排空后关连接）。
+      input->RetrieveAll();
+      return;
+    }
     // ★ 先判大小再 append：单次可读事件最多能灌进 ~1MB（16×64KB），
     //   先 append 再判等于允许"每条连接瞬时 1MB × 无上限连接数"。
     if (request->size() + input->ReadableBytes() > kMaxMetricsHttpRequestBytes) {
@@ -1116,6 +1173,7 @@ void Server::Impl::MetricsConnectionInLoop(const std::shared_ptr<net::Connection
         request->find("\n\n") == std::string::npos) {
       return;  // 请求头还没收全
     }
+    *responded = true;
     WriteMetricsResponse(c, *request);
   });
   conn->SetCloseCallback([this, fd](const std::shared_ptr<net::Connection>& c) {

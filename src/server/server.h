@@ -103,11 +103,29 @@ class Server : private NonCopyable {
   //   qzrpc_server_response_total           (Counter)    累计响应数
   //   qzrpc_server_rejected_total           (Counter)    过载拒绝数
   //   qzrpc_server_error_total              (Counter)    非 ok 响应数
-  //   qzrpc_server_request_latency_us       (Histogram)  请求端到端延迟（收到帧→写出响应，微秒）
-  //   qzrpc_server_queue_wait_us            (Histogram)  业务排队等待（微秒）
-  //   qzrpc_server_worker_busy              (Counter)    **累计**业务执行耗时（微秒，`Inc(us)`），
-  //       用来算利用率（`rate(worker_busy)/rate(请求数)`）。名字看起来像瞬时并发数，
-  //       实际是累计量——看板配置时按 `rate()` 用，别直接读原始值当"当前忙几个"。
+  //   qzrpc_server_request_latency_us       (Histogram)  端到端延迟（收帧 → 响应写入发送缓冲，
+  //       微秒）。**不含内核真正把字节发出去的时间**——Send 只是入队，异步写出不在测量范围内，
+  //       所以它不是"客户端观测到的延迟"，对账时的差值就是内核缓冲 + 网络。
+  //   qzrpc_server_queue_wait_us            (Histogram)  **纯排队**（收帧 → worker 开始执行，
+  //       微秒）。不含业务执行时间；它也是自适应拒绝的输入，混入业务耗时会退化成"对慢反应"。
+  //   qzrpc_server_worker_busy_us_total     (Counter)    **累计**业务执行耗时（微秒，`Inc(us)`），
+  //       计量区间是 handler 进入 → handler 返回。用来算利用率
+  //       （`rate(worker_busy_us_total)/rate(请求数)`）。名字**必须**带 `_us_total`：
+  //       旧名 `qzrpc_server_worker_busy` 在 Prometheus 语义里读起来像 Gauge，
+  //       看板会按瞬时值画成无意义的锯齿线。
+  //   qzrpc_server_registry_register_total   (Counter)  自注册成功次数（`registry_endpoint` 非空时）
+  //   qzrpc_server_registry_heartbeat_total  (Counter)  心跳成功次数
+  //   qzrpc_server_registry_errors_total     (Counter)  注册/心跳失败次数。持续增长 = 注册中心
+  //       有问题，此时本机仍在服务，只是发现性在退化
+  //   qzrpc_server_metrics_conn_rejected_total (Counter) `/metrics` 端点因并发连接数超过
+  //       `kMaxMetricsConnections` 而拒绝的连接数。**非零说明有人在打这个端口**——
+  //       它无鉴权，正常抓取不该把它顶到上限
+  //
+  // ★ 上面 `queue_wait_us` / `worker_busy_us_total` / `request_latency_us` 三个区间的措辞
+  //   已按 `server.cpp` md5 `457fed43`（2026-02）逐点核对过：排队在 handler **之前**采样、
+  //   业务耗时取 handler 进出之差、端到端测到"响应写入发送缓冲"为止。B1/B2 修复之前
+  //   它们不是这个语义（排队含业务耗时、延迟不含排队与业务）——**再动这三个采样点时，
+  //   先改这段注释再改代码**，否则看板上三个数会一起说谎，而且彼此看起来还挺自洽。
   static void RegisterDefaultMetrics();
 
  private:
