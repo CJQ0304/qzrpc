@@ -91,9 +91,14 @@ bool RoundRobinBalancer::Select(const std::string& key, std::size_t attempt,
   const std::uint64_t ticket = impl_->cursor.fetch_add(1, std::memory_order_relaxed);
   std::lock_guard<std::mutex> lk(impl_->mutex);
   if (impl_->endpoints.empty()) return false;
-  // attempt 作为偏移：重试时必然换一个实例（列表长度大于 1 时）。
-  const std::size_t index =
-      static_cast<std::size_t>((ticket + attempt) % impl_->endpoints.size());
+  // ★ **不要**在这里加 attempt 偏移。曾经写成 (ticket + attempt) % size，
+  //   而 ticket 每调用一次 Select 就 +1、attempt 每次重试也 +1 —— 两个增量在同一个模里
+  //   互相抵消：size == 2 时 (0,0)(1,1)(2,2) 全部落到下标 0，重试永远打在同一个实例上。
+  //   实测症状：双实例挂一个时 20 次调用 10 成功 / 7388ms（本该 20 成功 / 200ms 量级），
+  //   而三实例反而看不出问题（(0,0)(1,1)(2,2) → 0,2,1 会轮），属于最难在验收里暴露的那类。
+  //   游标本身已经保证"相邻两次 Select 落在相邻下标"，这就是我们需要的换实例语义。
+  (void)attempt;  // 其他策略（随机/一致性哈希）用它做避让，轮询不需要
+  const std::size_t index = static_cast<std::size_t>(ticket % impl_->endpoints.size());
   *out = impl_->endpoints[index];
   return true;
 }
@@ -281,9 +286,16 @@ bool ConsistentHashBalancer::Select(const std::string& key, std::size_t attempt,
 
   if (key.empty()) {
     // 没有哈希键 → 退化为轮询（契约要求，不是偷懒）。
+    //
+    // ★ 这里**不要**加 attempt 偏移，与 RoundRobinBalancer::Select 同一个坑：
+    //   cursor 每调用一次就 +1、attempt 每次重试也 +1，两个增量在同一个模里互相抵消，
+    //   size == 2 时 (0,0)(1,1)(2,2) 全部落到下标 0 —— 重试永远打回同一个实例，
+    //   而那正是上一次失败的那个。三实例时 (0,2,1) 会轮，所以验收脚本很难撞上；
+    //   曾经就是靠"双实例挂一个，10/20 成功、耗时 7000ms"才定位到的。
+    //   重试要避开已失败的节点，靠 Channel::Call 里的 failed_endpoints 去重，
+    //   不靠这里偏移。
     const std::uint64_t ticket = impl_->cursor.fetch_add(1, std::memory_order_relaxed);
-    *out = snapshot->endpoints[static_cast<std::size_t>(
-        (ticket + attempt) % snapshot->endpoints.size())];
+    *out = snapshot->endpoints[static_cast<std::size_t>(ticket % snapshot->endpoints.size())];
     return true;
   }
 

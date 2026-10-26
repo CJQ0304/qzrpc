@@ -101,7 +101,11 @@ class ClientConnection : private NonCopyable {
   //   * 超时 → **槽位保留**并标 abandoned，不能删（删了迟到响应会命中下一个同 seq 的调用，
   //     症状是"A 的响应交给 B"，只在超时+并发下偶发）；
   //   * 迟到响应命中 abandoned 槽 → 就地丢弃、删槽、late_response 计数，**不唤醒任何人**；
-  //   * abandoned 槽位超过 256 个 → 主动关连接重建（abandoned_overflow 计数）。
+  //   * abandoned 槽位超过 256 个（`kMaxAbandonedSlots`）→ 主动关连接重建。
+  //     **这是防御性上限，没有配套指标**，且**正常调用路径不可达**：走连接池的调用
+  //     受池容量与在飞上限约束，单个连接上攒不出 256 个 abandoned 槽位。它防的是
+  //     `ClientConnection` 被绕过连接池、直接多线程使用的误用 —— 真触发了说明用法
+  //     已经越界，该看的是调用方代码，不是监控曲线。
   //   * 连接关闭（HandleClosed，loop 线程）→ 全部在飞调用**一次性以 kCancelled 唤醒**并清表，
   //     不能让它们各自等满 deadline，否则对端一崩业务线程池就被拖满。
   Status Call(std::uint32_t method_id, const std::string& payload,

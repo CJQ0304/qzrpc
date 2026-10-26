@@ -137,10 +137,12 @@ class Channel : private NonCopyable {
   //   qzrpc_client_latency_us         (Histogram) 端到端延迟
   //   qzrpc_client_pool_acquire_us    (Histogram) 借连接耗时
   //   qzrpc_client_late_response_total(Counter)   超时后到达、被就地丢弃的响应数
-  //                                               （doc 03 §3.4 S-2；非零说明有服务端慢于 deadline）
-  //   qzrpc_client_abandoned_overflow_total
-  //                                   (Counter)   因 abandoned 槽位超过 256 而重建连接的次数
-  //                                               （S-3；持续增长说明对端或链路已不正常）
+  //                                               （doc 03 §3.4 S-2）。
+  //       ★ **当前走连接池的路径下恒为 0**：`Call` 超时即把连接标不健康 → `Lease` 析构
+  //         `Invalidate` → 连接当场关闭 → 迟到响应到达时连接已不存在，那个 Inc 分支不会执行。
+  //         非零只可能来自"绕过连接池直接多线程使用 `ClientConnection`"的误用。
+  //         待连接池改造（超时不再作废连接、由墓碑吸收迟到响应）落地后，它才变成
+  //         "有服务端慢于 deadline" 的真信号 —— 到那时请把本段删掉。
   static void RegisterDefaultMetrics();
 
  private:

@@ -64,6 +64,17 @@ namespace {
 // 每条连接允许存在的墓碑（调用方已放弃、等迟到响应的槽位）上限。
 constexpr std::size_t kMaxAbandonedSlots = 256;
 
+// 连续失败多少次才认定"这条连接在系统性丢响应"并主动 Close 重建。
+//
+// ★ 这是 A 方案（超时不再作废连接）的**唯一**退役阈值，值取 3 的理由：
+//   · 1 次超时不说明连接坏了 —— 服务端那个方法只是慢，链路完全正常；
+//   · 2 次也可能只是同一个慢方法被连着调了两回（重试场景极常见）；
+//   · 3 次连续、中间没有任何一次成功响应（:319 收到合法响应会清零），
+//     才排除"偶发慢"这个解释。
+//   注意它和 kMaxAbandonedSlots 不是一回事：那是**防御性上限**（正常路径不可达），
+//   这是**正常工作阈值**（慢服务 + 重试就会走到）。
+constexpr std::uint32_t kMaxConsecutiveFailuresBeforeClose = 3;
+
 // seq 分配的最大探测次数。正常情况一次就中；只有 2^32 回绕后的极端撞车才需要多试。
 constexpr std::uint32_t kSeqProbeLimit = 65536;
 
@@ -409,9 +420,16 @@ Status ClientConnection::Call(std::uint32_t method_id, const std::string& payloa
         // 失败时清空输出，避免调用方误用半成品。
         if (resp_payload != nullptr) resp_payload->clear();
         if (resp_metadata != nullptr) resp_metadata->Clear();
-        if (status.code() == StatusCode::kTimeout ||
-            status.code() == StatusCode::kCancelled) {
+        if (status.code() == StatusCode::kCancelled) {
+          // 走到这里的 kCancelled 只有一个来源：WakeAllWaiters（对端关连接 / 池停机）。
+          // 连接**真的**废了，判死不冤 —— 这条是 A 方案之后 Call 里**唯一**的
+          // healthy_.store(false)，且它不在超时分支上。超时分支一个字都不许有。
           healthy_.store(false, std::memory_order_relaxed);
+          consecutive_failures_.fetch_add(1, std::memory_order_relaxed);
+        } else if (status.code() == StatusCode::kTimeout) {
+          // 服务端**回了包**，只是有界地说"我排队超时了"（HandleRequestInWorker ①）。
+          // 链路是通的、对端听得见我们 —— 判死等于把一条好连接扔掉，还会让池反复重连。
+          // 只记失败次数，healthy_ 保持原样。
           consecutive_failures_.fetch_add(1, std::memory_order_relaxed);
         }
       }
@@ -426,10 +444,28 @@ Status ClientConnection::Call(std::uint32_t method_id, const std::string& payloa
     lk.unlock();
   }
 
-  healthy_.store(false, std::memory_order_relaxed);
-  consecutive_failures_.fetch_add(1, std::memory_order_relaxed);
+  // ★★ A 方案：超时**不作废连接**。★★
+  //
+  // 以前这里是 `healthy_.store(false)`，而那正是"墓碑机制是死代码"的病因：
+  //   Call 超时 → 槽位标成墓碑（上面刚做完）→ healthy_=false →
+  //   Channel 的 Lease 析构看到 !healthy() → pool->Invalidate → 连接被关 →
+  //   迟到的响应永远收不到 → `late_response_total` 恒 0、`kMaxAbandonedSlots` 永不触发。
+  //   也就是说 `connection_pool.h:101-104` 那四条 seq 生命周期契约里，后两条在走连接池的
+  //   路径上**一行都没执行过**。代码在和自己的注释打架。
+  //
+  // 现在"链路还活不活"由三个独立信号决定，超时只是其中之一：
+  //   · 收到合法响应（HandleBytes 里）→ consecutive_failures_ 清零 + healthy_ 恢复；
+  //   · 对端关连接（HandleClosed）→ kCancelled，连接确实废了，另走 :415 那条；
+  //   · 连续 kMaxConsecutiveFailuresBeforeClose 次失败且中间一次成功都没有 → 下面 Close()。
+  //
+  // 用 fetch_add 的返回值判定，而不是 fetch_add 之后再 load：清零可能在两行之间发生
+  // （loop 线程收到迟到之前的正常响应），那会让阈值永远数不满，白设。
+  const std::uint32_t failures =
+      consecutive_failures_.fetch_add(1, std::memory_order_relaxed) + 1;
 
-  // 墓碑过多 → 这条连接在丢响应，主动关掉重建（顺带清空所有墓碑）。
+  // 两条退役路径：
+  //   ① 墓碑过多（防御性上限，正常路径不可达，见头文件 §Call 的说明）；
+  //   ② 连续失败达到阈值（正常工作阈值，慢服务 + 重试就会走到）。
   std::size_t abandoned = 0;
   bool over_limit = false;
   {
@@ -442,6 +478,10 @@ Status ClientConnection::Call(std::uint32_t method_id, const std::string& payloa
   }
   if (over_limit) {
     QZ_LOG_WARN << "[Client] " << abandoned << " abandoned seq slot(s) on " << peer_.ToString()
+                << ", closing connection to rebuild";
+    Close();
+  } else if (failures >= kMaxConsecutiveFailuresBeforeClose) {
+    QZ_LOG_WARN << "[Client] " << failures << " consecutive failure(s) on " << peer_.ToString()
                 << ", closing connection to rebuild";
     Close();
   }
@@ -617,6 +657,12 @@ struct ConnectionPool::Impl {
     for (auto& one : dead) Retire(std::move(one));
     if (!dead.empty()) {
       QZ_LOG_DEBUG << "[ClientPool] reaped " << dead.size() << " idle connection(s)";
+      // 回收改变了 entry.total()（可能让"满"变"不满"），等在 cv 上的 Acquire
+      // 应该立刻重试，而不是睡到自己的 acquire_timeout 才醒。
+      // 严格说这条 notify 命中的概率不高（能进 cv 等待的前提就是 idle 为空，
+      // 而这里回收的正是 idle）—— 但被回收的也可能带着 closed/unhealthy 标记，
+      // 一个白等满 acquire_timeout 的调用方会被误判成"池耗尽"。notify 很便宜，加。
+      cv.notify_all();
     }
   }
 

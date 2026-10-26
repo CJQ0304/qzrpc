@@ -517,10 +517,19 @@ Status Channel::Call(std::uint32_t method_id, const serde::Message& request,
 
     // ---- 选一个本轮还没试过的 endpoint ----
     // ⚠️ 这里**不能**再额外传一个"每次调用都自增"的偏移进去。
-    //    RoundRobin 的取号本身就是自增的（index = ticket + attempt），
+    //    RoundRobin 的取号本身就是自增的（index = ticket % size，每次调用游标 +1；
+    //    attempt 只作为避让提示传给 balancer，**不参与取号**），
     //    再叠加一个自增偏移会让下标每次跳 2 —— 两个实例时永远落回同一个实例，
     //    症状是"故障转移看起来没生效、每两次失败一次"。实测踩过。
+    //    （`ticket + attempt` 正是我们修掉的那个公式：size==2 时 (ticket+attempt)%2 与
+    //     ticket%2 只差一个奇偶翻转，而 attempt 递增的奇偶又与 ticket 递增的奇偶同步，
+    //     于是净效果恒等 —— 重试永远打回同一个实例。）
     //    正确做法：偏移只放"轮次"，换实例靠下面的 failed_endpoints 去重。
+    //
+    //    另外注意这个探测循环最多调 max_candidates*2+2 次 Select，所以**一轮里游标会
+    //    推进不止一次**（双实例下通常第 2 次探测就返回另一个）。按 Select 的新契约
+    //    （调用即推进）这是合法的，也正因为如此"先取号再判空"必须保留；
+    //    但如果将来有人把这个循环挪到多线程上，游标推进次数就不再是"每轮一次"的整数倍。
     net::Endpoint ep;
     bool picked = false;
     for (int probe = 0; probe < max_candidates * 2 + 2; ++probe) {
