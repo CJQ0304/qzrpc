@@ -15,7 +15,7 @@
 | **韩渡川** | 构建系统 + 单元测试 + 脚本 + `common/` 实现 + README 门面 | 7 `.cpp` + CMake + 11 测试 + 4 脚本 | 一条命令能构建、能跑测试 |
 | **霍承钧** | `net/` `serialize/` `protocol/` `server/` `client/` `registry/` 全部实现 | 28 `.cpp` | 框架本体可编译、可运行 |
 | **苏映棠** | `codegen/qzcodegen/`（Python）+ `generated/` 产物 + `example/` + 前端页 | 9 `.py` + `__init__.py` + 2 生成物 + 6 示例 + 1 HTML | IDL 能生成、Demo 能跑通、页面能演示 |
-| **顾图南** | 全部 `docs/` + 全部 `src/**/*.h`（契约）+ `idl/*.qz` | 37 `.h` + 1 平台头 + 5 `.md` + 1 `.qz` | 契约冻结、文档可交付 |
+| **顾图南** | 全部 `docs/` + 全部 `src/**/*.h`（契约）+ `idl/*.qz` | 37 `.h` + 1 平台头 + 6 `.md` + 1 `.qz` | 契约冻结、文档可交付 |
 
 > **并行安全性论证**：三人的写文件集合**两两不相交**；唯一的依赖是"头文件存在"（已满足）
 > 与"common 实现存在"（只影响**链接**，不影响**编译**）。因此三人可以**同时开工**，
@@ -36,7 +36,7 @@
 | P0 | **设计契约** | 37 个公共头 + `platform.h` 在 `/std:c++17 /W4 /WX /permissive-` 下零警告编译通过；`idl/echo.qz` 与 doc 04 逐字一致 |
 | P1 | **内核实现** | 一个事件循环能驱动定时器与一对 socket 收发；**`test_codec` 第 1 项（37 字节 golden 串）通过**——全项目第一个"真的能跑"的里程碑；`method_id` 两端一致 |
 | P2 | **运行时实现** | `generated/echo.qz.{h,cpp}` 在 `/W4 /WX` 下零警告通过；回环 echo 两端跑通；`server`/`client`/`registry` 编成静态库 |
-| P3 | **示例与演示** | `scripts/run_demo` 一键起 registry + 2 个 server + client 并正常收工；演示页能看到 QPS / P99 |
+| P3 | **示例与演示** | `scripts/demo.ps1` 一键起 registry + 2 个 server + client，**8 步**跑完打印 `DEMO OK: 8 steps`；演示页能看到 P50/P99 与错误率（**不贴绝对 QPS**，理由见 doc 06 §6） |
 | P4 | **验收** | `test_e2e_echo` 全绿（**含"同连接并发 32 请求 + 乱序回包"用例**）；压测数据入档；CI 检查项全绿；README 能让陌生人 5 分钟内跑起来 |
 
 > **每张表的「阶段」列就是这个文件最晚可以开工的阶段**；同一阶段内**按表的行序**决定先后
@@ -68,7 +68,7 @@ P2 运行时实现
 P3 示例与演示
   苏映棠：example/{echo_service_impl,echo_server,echo_client,registry_main}
           + example/conf/*.conf + example/web/index.html
-  韩渡川：scripts/{build,run_demo}.ps1 + scripts/build.sh + example/CMakeLists.txt
+  韩渡川：scripts/{build,demo}.ps1 + scripts/build.sh + example/CMakeLists.txt
 
 P4 验收
   韩渡川：tests/test_e2e_echo.cpp（含乱序用例）+ scripts/bench.ps1
@@ -150,7 +150,7 @@ P4 验收
 | P-01 | `src/protocol/frame.cpp` | `FrameHeader::EncodeTo/DecodeFrom` 直接用 `common/endian.h` 的 `StoreBig32/LoadBig32`；`Metadata::Encode/Decode` 是纯 TLV 循环（key/wire_type 先行校验）；`Frame::ResetXxx` 负责把 `body_len` 等字段置默认 | codec、server、client | P2 |
 | P-02 | `src/protocol/codec.cpp` | `Decode` 严格按 doc 03 §8 的隐式状态机；**关键：解析 metadata 时用 `Reader` 子视图，不复制**；`Encode` 先算 `metadata.EncodedSize()` 再写 `body_len`（**不要先写头后回填**，容易忘） | server、client | P2 |
 
-**验收线**：`tests/test_codec.cpp` 必须逐条通过 doc 03 §14 的自检项（**12 项**，其中前 9 项属于 codec 本身，第 10–12 项属于客户端/连接层语义，归 T-11）。
+**验收线**：`tests/test_codec.cpp` 必须逐条通过 doc 03 §14 的自检项（**15 项**，其中前 10 项属于 codec 本身，第 11–15 项属于客户端/连接层语义，归 T-11。15 = 原 13 项 + `keep_alive` 按"正常回包/单向/错误回包"拆成三条：一条验收项覆盖 N 条路径就拆成 N 条）。
 其中第 1 项（用 37 字节十六进制串解出正确字段）是**整个项目的第一个"真的能跑"的里程碑**。
 
 ---
@@ -225,7 +225,7 @@ P4 验收
 
 | # | 路径 | 实现要点 | 被谁依赖 | 阶段 |
 | --- | --- | --- | --- | :-: |
-| E-01 | `generated/echo.qz.h` `.cpp` | codegen 产物，**提交入库**（便于 example 直接编译、便于 golden 测试比对） | example | P2 |
+| E-01 | `generated/echo.qz.h` `.cpp` | codegen 产物，**提交入库**（便于 example 直接编译、便于 golden 测试比对）。**必须 LF 行尾**：`.gitattributes` 已钉 `* text=auto eol=lf`，因为 CI 会把现场生成物与仓库版做 SHA256 **逐字节**比对——工作区被换成 CRLF 时，"新克隆的仓库跑一次 CI"必然红，而代码其实一点没问题 | example | P2 |
 | E-02 | `example/echo_service_impl.h` `.cpp` | 继承 `demo::EchoServiceBase`；`Echo` 回显 + 填 `served_by =` **实例的可辨识标识（demo 用实际监听端口）**——注意是 `server.port()` 而非构造时配置的端口（配置 `port = 0` 时只有 `Start()` 之后才知道真实值，要早于首个请求写进去）；`Notify` 只打日志 | echo_server | P3 |
 | E-03 | `example/echo_server.cpp` | 读 conf → 构造 `ServerOptions` → `Server` → `RegisterEchoService` → 启动后向 `RegistryClient` 注册自己 → `Run()` → 处理 `SIGINT/SIGTERM` 走 `Stop()` | — | P3 |
 | E-04 | `example/echo_client.cpp` | 两种模式：`--once` 单次调用打印结果；`--bench N T` 起 T 线程各调 N 次，输出 QPS/P50/P99 | — | P3 |
@@ -247,17 +247,23 @@ P4 验收
 | T-02 | `tests/test_buffer.cpp` | 扩容/compaction/`Retrieve` 越界/`AppendFrom` | P1 |
 | T-03 | `tests/test_writer_reader.cpp` | varint 边界（0/127/128/2^32-1）、zigzag、fixed 小端、负数 int32 的 10 字节 | P1 |
 | T-04 | `tests/test_timer_queue.cpp` | 一次性/周期性/取消/同一轮多个到期 | P1 |
-| T-05 | `tests/test_codec.cpp` | **doc 03 §14 里 codec 相关的 9 项逐条实现**，其中第 1 项用 37 字节 golden 串（第 10–12 项是客户端 seq 生命周期与 `keep_alive` 关闭语义，归 T-11） | P1 |
+| T-05 | `tests/test_codec.cpp` | **doc 03 §14 里 codec 相关的 10 项逐条实现**，其中第 1 项用 37 字节 golden 串、第 6 项覆盖 `flags` 三条规则（含 `kKnownFlagsMask` 的未定义位拒绝）（第 11–15 项是客户端 seq 生命周期与 `keep_alive` 的三条关闭语义，归 T-11） | P1 |
 | T-06 | `tests/test_frame_metadata.cpp` | metadata TLV 往返 + 未知 key 跳过 + 扩展键 | P1 |
 | T-07 | `tests/test_thread_pool.cpp` | 有界拒绝、`Stop(drain)`、任务全部执行完 | P2 |
-| T-08 | `tests/test_load_balancer.cpp` | RR 均匀性（10k 次分布）、一致性哈希的"节点增减影响 < 1/n" | P2 |
+| T-08 | `tests/test_load_balancer.cpp` | RR 均匀性（10k 次分布）、一致性哈希的"节点增减影响 < 1/n"；外加**三条退化断言**：① 轮询相邻两次 `Select` 必须换实例（`size > 1` 时）；② 一致性哈希 **空 key + `attempt` 从 0 递增必须换实例**；③ `size == 1` 时任意策略都返回同一个（`attempt` 递增也不例外）。<br>⚠️ ② 的判据要写对：**"空 key 连续选择交替"在出 bug 的旧实现下也是绿的**（`attempt` 恒 0 时 `(ticket+0)%2` 本来就交替），所以它不能当回归守卫；必须**固定一个空 key、每次递增 `attempt`**，旧实现会输出 `A A A A`（两个增量在模 2 下互相抵消），新实现才是 `A B A B` | P2 |
 | T-09 | `tests/test_service_registry.cpp` | 冲突检测（构造两个同 id 不同名）、SelfCheck | P2 |
 | T-10 | `tests/test_dispatcher.cpp` | 注册/查找/fallback/并发查找 | P2 |
-| T-11 | `tests/test_e2e_echo.cpp` | ① 起 `Server`（port=0）→ 起 `Channel` → 调 1000 次 → 校验返回值与 P99 → `Stop()` 后无泄漏；② **同连接并发 32 个请求 + 服务端故意乱序回包，客户端仍按 `seq` 正确配对：无串包、无超时误判**（覆盖 doc 03 §3.3 的 R-1/R-2/R-3 与连接池独占租约语义）；③ **seq 槽位生命周期**：服务端故意延迟到超过 deadline → 客户端拿 `kTimeout`；随后那条迟到响应到达 → 必须被丢弃（`late_response` 计数 +1）且**不影响后续同连接调用**；④ 在飞请求期间 `Server::Stop()` → 全部调用在**毫秒级**内以 `kCancelled` 返回（不是各自等满 deadline）；⑤ **`keep_alive = 0` 的收尾语义**：手写一个 `keep_alive=0` 的请求（绕过 `Channel`，直接用 `Codec` + socket）→ 必须**完整收到响应**且随后收到 FIN；断言"客户端没有走超时路径"，不是"服务端日志打了关闭"（doc 03 §4.1） | P4 |
+| T-11 | `tests/test_e2e_echo.cpp` | ① 起 `Server`（port=0）→ 起 `Channel` → 调 1000 次 → 校验返回值与 P99 → `Stop()` 后无泄漏；② **同连接并发 32 个请求 + 服务端故意乱序回包，客户端仍按 `seq` 正确配对：无串包、无超时误判**（覆盖 doc 03 §3.3 的 R-1/R-2/R-3 与连接池独占租约语义）；③ **seq 槽位生命周期**：服务端故意延迟到超过 deadline → 客户端拿 `kTimeout`；随后那条迟到响应到达 → 必须被丢弃（`late_response` 计数 +1）且**不影响后续同连接调用**；④ 在飞请求期间 `Server::Stop()` → 全部调用在**毫秒级**内以 `kCancelled` 返回（不是各自等满 deadline）；⑤ **`keep_alive = 0` 的收尾语义**：手写一个 `keep_alive=0` 的请求（绕过 `Channel`，直接用 `Codec` + socket）→ 必须**完整收到响应**且随后收到 FIN；断言"客户端没有走超时路径"，不是"服务端日志打了关闭"（doc 03 §4.1）。**必须分三条跑**：正常回包（可绿）/ 单向调用（可绿）/ **错误回包**（`status != 0`、停机中、过载、队列满——`server.cpp` md5 `5576910d` 已修，实测 `status != 0` 入口修前 FIN=无(500ms 超时)、修后 FIN=有(0ms)，`keep_alive=1` 对照组修前修后都是无）。⚠️ 结论必须写"**已实测 1 条 / 推定 3 条**"（另外三条走同一函数尾部同一行，代码上必然生效但没有各自的 raw 探针），且**没有 `keep_alive=1` 对照组的"收到 FIN"不算通过**——改成无条件关连接它也会绿 | P4 |
 | B-05 | `scripts/build.ps1` | 手工设 `INCLUDE/LIB`（**不要依赖 vcvars 里的 `reg.exe`，本机被安全策略禁用**）→ `cmake -G Ninja` 或 MSBuild | P1 |
 | B-06 | `scripts/build.sh` | `cmake -DCMAKE_BUILD_TYPE=Release && cmake --build -j` | P1 |
-| B-07 | `scripts/run_demo.ps1` | 起 registry → 起 2 个 server（不同端口）→ 起 client 跑 `--bench` → 收工 | P3 |
-| B-08 | `scripts/bench.ps1` | 多线程 × 多轮，输出 QPS / P50 / P99 / 错误率表格（直接用于 README 的性能章节） | P4 |
+| B-07 | `scripts/demo.ps1` | **给人看的**三进程演示，8 步：preflight 查二进制与端口 → registry → 两个 server（不同端口）→ 轮询（断言 **A、B 两个实例的 `request_total` 增量都 > 0 且 A+B == 迭代数**）→ bench A 容量模式 → bench B `--conns 1` → registry 视图 → 网页；收工打印 `DEMO OK: 8 steps` | P3 |
+| B-08 | `scripts/bench.ps1` | 多线程 × 多轮，输出 QPS / P50 / P99 / 错误率表格（数字入档时**先看同机重复性**，见 doc 06 §6） | P4 |
+| B-09 | `scripts/smoke.ps1` | **给 CI 看的**闸门，只回答"绿还是红"：采 `/metrics` 基线 → 跑 client → 断言 `request_total` 增量 == 迭代数、`error_total` 增量 == 0、退出码 == 0 → stdout **恰好一行 ASCII** `SMOKE OK calls=.. ok=.. fail=.. instances=.. [split=A/B] ms=..`，退出码 0/1。`-Instances 2` 时才输出 `split` 键 | P4 |
+
+> B-07 的轮询断言为什么要写"**两个实例增量都 > 0**"而不是只看总数：Windows 上
+> `SO_REUSEADDR` 会放行同一端口的二次 bind，一个残留的旧 server 进程可能抢走全部流量，
+> 而"总请求数对得上"这件事**依然成立**——那就是一次彻底的假绿。同理，判据也不能写成
+> "A+B == 迭代数"就完事，必须两个增量各自 > 0。
 
 ### 10.1 CMake 的两条硬要求
 
