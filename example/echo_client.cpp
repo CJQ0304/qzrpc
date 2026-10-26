@@ -621,9 +621,14 @@ int main(int argc, char** argv) {
     const std::uint64_t retry_total = registry.GetCounter("qzrpc_client_retry_total")->value();
     const std::uint64_t failover_total =
         registry.GetCounter("qzrpc_client_failover_total")->value();
-    std::printf("[client] retry_total=%llu failover_total=%llu\n",
+    // late_total：调用方已经放弃之后才到达、被就地丢弃的响应数。健康压测里它必须是 0 ——
+    // 它涨了就说明确实开始超时了（late 只可能发生在一次 timeout 之后），那个事实比 QPS 重要。
+    const std::uint64_t late_total =
+        registry.GetCounter("qzrpc_client_late_response_total")->value();
+    std::printf("[client] retry_total=%llu failover_total=%llu late_total=%llu\n",
                 static_cast<unsigned long long>(retry_total),
-                static_cast<unsigned long long>(failover_total));
+                static_cast<unsigned long long>(failover_total),
+                static_cast<unsigned long long>(late_total));
   }
 
   channel.Stop();
