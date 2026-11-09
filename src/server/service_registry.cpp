@@ -19,6 +19,9 @@
 
 #include <algorithm>
 #include <cstdio>
+// 同 dispatcher.cpp：std::unique_lock 需要 <mutex>。MSVC 的 <shared_mutex> 传递包含
+// 了它，libstdc++ 没有，靠传递包含会只在 GCC 上炸。
+#include <mutex>
 #include <set>
 #include <string>
 #include <utility>

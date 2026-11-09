@@ -409,7 +409,20 @@ void TestUnboundedQueueAcceptsEverything() {
 }
 
 // 销毁时不得执行残留任务：业务闭包可能捕获已经析构的对象，
-// 所以析构走 Stop(false)（见 .cpp）。这里用一个"对象已析构后再执行会读到毒值"的场景验证。
+// 所以析构走 Stop(false)（见 .cpp），先 swap 掉队列再 join。
+//
+// ★ 这条用例原先是一条**没有因果的竞态断言**，Linux 上首次实机执行时 30 次里红 24 次：
+//   它先 notify 放行 worker、再让作用域立刻结束触发析构，然后断言 ran < 3。
+//   但"放行 worker"与"析构清空队列"之间没有任何同步 —— worker 完全可能在析构之前
+//   把那 3 个任务抢走。Windows 上只是碰巧总是析构先赢，所以从没红过。
+//   这不是平台差异，是断言本身在赌调度顺序。
+//
+// 现在改成因果等待：Stop(false) 在锁内 swap 队列（先清空）之后才 join，
+// 于是改为在另一个线程里调 Stop(false)，主线程等 queue_size() 归零 ——
+// 队列只可能是被那次 swap 清空的（唯一的 worker 正卡在 gate 里，不可能 pop），
+// 所以归零即"残留任务已成定局"，此时才放行 worker。放行后 worker 看到空队列直接退出，
+// 因此 ran 必须是精确的 0，而不是"小于 3"。
+// 析构仍被覆盖：作用域结束时析构，Stop 的幂等分支让它立即返回。
 void TestDestructorDoesNotRunPendingTasks() {
   std::atomic<int> ran{0};
   {
@@ -427,19 +440,28 @@ void TestDestructorDoesNotRunPendingTasks() {
                 static_cast<int>(pool.SubmitResult::kOk));
     QZ_CHECK(WaitFor([&worker_entered] { return worker_entered.load(); }));
 
-    // 3 个排队任务：析构时必须被丢弃。
+    // 3 个排队任务：Stop(false) 必须丢弃它们。
     for (int i = 0; i < 3; ++i) {
       QZ_CHECK_EQ(static_cast<int>(pool.Submit([&ran] { ran.fetch_add(1); })),
                   static_cast<int>(pool.SubmitResult::kOk));
     }
+    QZ_CHECK_EQ(static_cast<int>(pool.queue_size()), 3);
+
+    // 在另一个线程里停：它清空队列后阻塞在 join（唯一 worker 还卡在 gate 上）。
+    // 走的正是析构那条路径（~ThreadPool -> Stop(false)）。
+    std::thread stopper([&pool] { pool.Stop(false); });
+
+    // 因果等待：队列只可能被 Stop 的 swap 清空 —— worker 出不来，无法 pop。
+    QZ_CHECK(WaitFor([&pool] { return pool.queue_size() == 0; }));
+
     {
       std::lock_guard<std::mutex> lock(gate_mutex);
       gate_open = true;
     }
     gate_cv.notify_all();
-    // 不等它们跑完就析构：析构里的 Stop(false) 会先清队列再 join。
+    stopper.join();
   }
-  QZ_CHECK(ran.load() < 3);
+  QZ_CHECK_EQ(ran.load(), 0);
 }
 
 }  // namespace

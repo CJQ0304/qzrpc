@@ -29,7 +29,40 @@ option(QZRPC_WERROR "Treat compiler warnings as errors" OFF)
 # Python 解释器与 codegen 包位置：定义在最前面，因为 tests/ 里也要用（把 codegen 的
 # Python 单测挂进同一个 ctest）。刻意不用 find_package(Python3)：CMakeLists 里
 # 不出现任何 find_package 是一条可机械检查的"零第三方依赖"证据。
-set(QZRPC_PYTHON "python" CACHE STRING "Python 3 interpreter for the code generator")
+#
+# 默认值不能是裸名 "python"：Ubuntu 24.04+ 只随系统装 python3，没有 python，
+# 于是 ctest 的 codegen_python 会以 "Unable to find executable: python" 直接 Not Run
+# （Linux 首次实机执行时就是这么红的）。裸名还会被不同 shell 解析成不同解释器 ——
+# scripts/ci.sh 的 pick_python() 早就为这件事钉了绝对路径，这里对齐。
+# find_program 只是查找可执行文件、不引入任何依赖，上面那条 find_package 约束仍成立；
+# -DQZRPC_PYTHON=... 的覆盖能力保持不变。
+set(QZRPC_PYTHON "" CACHE STRING "Python 3 interpreter for the code generator (empty = auto-detect)")
+
+# 旧缓存自愈：CACHE STRING 不会因为本文件默认值变了就覆盖已有条目，所以从上一版
+# （默认裸名 "python"）升上来的 build/ 目录里仍留着 python，而 Ubuntu 上没有这个命令。
+# 直接沿用会让生成命令在构建期报一句"no such file or directory"——看不出跟 Python 有关。
+# 这里在 configure 阶段就把失效的缓存值丢掉重探，让 git pull 后直接 cmake --build 也能走通。
+if (QZRPC_PYTHON)
+  find_program(QZRPC_PYTHON_STALE_CHECK NAMES "${QZRPC_PYTHON}")
+  if (NOT QZRPC_PYTHON_STALE_CHECK)
+    message(STATUS "qzrpc: cached QZRPC_PYTHON='${QZRPC_PYTHON}' is not executable, re-detecting")
+    unset(QZRPC_PYTHON CACHE)
+    unset(QZRPC_PYTHON_DETECTED CACHE)
+  endif()
+  unset(QZRPC_PYTHON_STALE_CHECK CACHE)
+endif()
+
+if (NOT QZRPC_PYTHON)
+  find_program(QZRPC_PYTHON_DETECTED NAMES python3 python)
+  if (QZRPC_PYTHON_DETECTED)
+    set(QZRPC_PYTHON "${QZRPC_PYTHON_DETECTED}" CACHE STRING "Python 3 interpreter for the code generator" FORCE)
+    message(STATUS "qzrpc: python interpreter = ${QZRPC_PYTHON}")
+  else()
+    set(QZRPC_PYTHON "python3" CACHE STRING "Python 3 interpreter for the code generator" FORCE)
+    message(WARNING "qzrpc: no Python 3 interpreter found; codegen and codegen_python "
+                    "will fail. Pass -DQZRPC_PYTHON=/path/to/python3.")
+  endif()
+endif()
 set(QZRPC_CODEGEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/codegen" CACHE PATH "Directory containing the qzcodegen package")
 
 # ---------------------------------------------------------------------------

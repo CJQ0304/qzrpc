@@ -18,6 +18,10 @@
 #include "server/dispatcher.h"
 
 #include <algorithm>
+// <mutex> 必须显式包含：本文件用 std::unique_lock，而 MSVC 的 <shared_mutex> 会传递
+// 拉进 <mutex>，libstdc++ 不会 —— 在 GCC 上缺这一行就报 "'unique_lock' is not a
+// member of 'std'"。传递包含是平台差异，不是接口保证。
+#include <mutex>
 #include <string>
 #include <utility>
 

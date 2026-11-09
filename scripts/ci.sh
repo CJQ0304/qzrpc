@@ -130,9 +130,9 @@ step "Stage 1/4: build + ctest"
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
   printf '    skipped (SKIP_BUILD=1)\n'
 elif [ "${SKIP_TESTS:-0}" = "1" ]; then
-  SKIP_TESTS=1 "${here}/build.sh"
+  CHECKS=1 SKIP_TESTS=1 "${here}/build.sh"
 else
-  "${here}/build.sh"
+  CHECKS=1 "${here}/build.sh"
 fi
 
 rm -rf "${ci_dir}"

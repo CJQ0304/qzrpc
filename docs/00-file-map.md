@@ -161,7 +161,7 @@ P4 验收
 | --- | --- | --- | --- | :-: |
 | V-01 | `src/server/dispatcher.cpp` | `unordered_map` + `shared_mutex`；`Register` 检测 id 冲突并回填 err；`Find` 用 `shared_lock` | server、生成代码 | P2 |
 | V-02 | `src/server/service_registry.cpp` | 双索引（`by_id_` / `by_name_`）；`RegisterMethod` 先重算 `MethodIdOfName(full_name)` 比对；`DescribeMethod` 未命中回 `"unknown#0x%08x"` | server、生成代码 | P2 |
-| V-03 | `src/server/server_options.cpp` | `FromConfig` 逐字段读 + 校验；`ToIniText` 输出带 `# 注释` 的完整默认配置；`Validate` 检查 `port<=65535`、线程数 ≥1、`max_frame_size <= kAbsoluteMaxFrameSize` | server | P2 |
+| V-03 | `src/server/server_options.cpp` | `FromConfig` 逐字段读 + 校验；`ToIniText` 输出带 `# 注释` 的完整默认配置；`Validate` 检查线程数 ≥1、`max_frame_size <= kAbsoluteMaxFrameSize`，端口上界由 `static_assert(sizeof(port) <= 2)` 在编译期守住（`uint16` 的值域使运行时比较成为 GCC 的 `-Wtype-limits`，`-Werror` 下无法保留） | server | P2 |
 | V-04 | `src/server/server.cpp` | **最大的一个文件**，`Impl` 内含：`Acceptor` + `vector<unique_ptr<ReactorWorker>>`（每项 = `EventLoop` + 线程 + 连接表）+ `ThreadPool` + 空闲回收定时器 + 自适应拒绝状态 + 四步停机状态机 + **独立 metrics HTTP 监听**（手写 HTTP/1.0 解析）+ **自注册线程**（`registry_endpoint` 非空时，doc 02 §2.4.1）。实现要点见 §6.1 | example、registry | P2 |
 
 ### 6.1 `server.cpp` 的五个实现要点

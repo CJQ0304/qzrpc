@@ -1232,7 +1232,11 @@ void Server::Impl::WriteMetricsResponse(const std::shared_ptr<net::Connection>& 
     // 活跃连接数用 gauge 手写：Counter 只能 Inc()，给不出会下降的"当前值"，
     // 硬塞一个只会涨的假活跃数比不报更坏（见文件头决策 3）。
     const std::int64_t active = conn_count.load(std::memory_order_relaxed);
-    char line[160];
+    // 缓冲区按最坏情况留足：静态前缀约 148 B + 19 位数字 + 换行 + NUL = 171 B。
+    // 原来给 160 时 GCC 会报 -Wformat-truncation（"output between 149 and 167 bytes
+    // into a destination of size 160"），-Werror 下直接构建失败 —— 这个警告是对的，
+    // 连接数大到 10 位数时那行确实会被截断，指标文本就坏了。
+    char line[256];
     std::snprintf(line, sizeof(line),
                   "# HELP qzrpc_server_connection_active Current established connections.\n"
                   "# TYPE qzrpc_server_connection_active gauge\n"

@@ -398,8 +398,12 @@ bool ServerOptions::Validate(std::string* err) const {
 
   // ---- 端口 ----
   // port 是 uint16，天然 <= 65535；这里只提示"0 表示随机端口"这一特殊情况。
-  // （保留显式检查是为了将来 port 类型变更时不会静默失效。）
-  if (port > 65535) problems.push_back("port " + std::to_string(port) + " > 65535");
+  // 原先写的是 `if (port > 65535)`，在 GCC 上必然触发 -Wtype-limits
+  // （"comparison is always false due to limited range of data type"），
+  // -Werror 下直接构建失败。改用 static_assert 表达同一个意图：
+  // 一旦有人把 port 改宽，编译期立刻失败，提醒回来补上界检查。
+  static_assert(sizeof(port) <= 2,
+                "ServerOptions::port widened beyond 16 bits: add an explicit upper-bound check");
 
   // ---- 线程模型 ----
   if (io_thread_count == 0) problems.push_back("io_thread_count must be >= 1");

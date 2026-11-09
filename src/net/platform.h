@@ -30,6 +30,7 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>  // addrinfo / getaddrinfo / freeaddrinfo（Windows 侧由 ws2tcpip.h 提供）
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
