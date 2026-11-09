@@ -25,15 +25,17 @@
 # path. Passing /tmp/x.cpp straight through makes cl treat it as an option and fail
 # with "D8003: missing source filename". winpath() below does the cygpath -w dance.
 #
-# ★ HONESTY NOTE -- this file has NOT been executed on Linux or macOS.
-#   It was written against the same four stages as scripts/ci.ps1 (which runs green on
-#   Windows) and reviewed line by line, but the only machine available to its author
-#   runs MSVC. Concretely: the GCC/Clang branch, `-Werror` behaviour on the generated
-#   code under GCC, and the BSD userland of macOS have not been exercised.
-#   Saying so is more useful than shipping a script that *looks* cross-platform
-#   verified. If you run it somewhere else, expect to fix small things -- the two
-#   known portability traps (BSD `date +%s%N`, `sort -z`) are already worked around
-#   below, but there may be others.
+# ★ EXECUTION NOTE -- green on Linux; only on Linux.
+#   Verified: Ubuntu 26.04 / GCC 15.2 / CMake 4.2.3, fresh clone, `./scripts/ci.sh`
+#   -> CI_EXIT=0 in ~9s, 13/13 tests, zero warnings under -Werror (CHECKS=1).
+#   Note the count: interop_protobuf is NOT registered where no protobuf runtime
+#   exists (it is not silently skipped), so Linux reports 13 while Windows reports 14.
+#   The first Linux run is what produced the fixes now in this script, in
+#   src/net/platform.h and in CMakeLists.txt -- "it parses" and "it ran" are
+#   different claims, and only the second one counts.
+#   NOT verified: macOS / BSD userland, and the Clang branch. The two known
+#   portability traps (BSD `date +%s%N`, `sort -z`) are worked around below, but
+#   there may be others. Expect to fix small things if you run it there.
 #
 # Portability rules followed here, because macOS ships BSD userland:
 #   * no `date +%s%N` (GNU only)   -> elapsed_ms() falls back to second precision

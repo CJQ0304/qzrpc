@@ -276,10 +276,11 @@ CI_EXIT=0
 
 已验证范围与**未**验证范围，分开写：
 
-- **已验证**：Windows + MSVC 19.5x，从干净克隆到 `ci.ps1` 四阶段全绿（本仓库的默认路径）。
-- **未验证**：POSIX 路径（`scripts/build.sh`、`scripts/ci.sh`）—— 代码已写、经逐条评审，
-  但**未在本环境的任何 gcc / clang 上编译过**（本机只有 MSVC）。**跨平台不是本项目的验证范围**，
-  具体到哪几条已知会被绕过、哪几条没验证，见下方「已知边界」第一条。
+- **已验证 · Windows**：MSVC 19.5x，从干净克隆到 `ci.ps1` 四阶段全绿（本仓库的默认路径），`14/14`。
+- **已验证 · Linux**：Ubuntu 26.04 / GCC 15.2 / CMake 4.2.3，全新克隆直接 `./scripts/ci.sh`
+  四阶段全绿，`13/13` 用例、`-Werror` 零警告、`CI_EXIT=0`（9 秒）。
+- **未验证**：macOS / BSD userland。`ci.sh` 里为 BSD 做的两处规避（`date +%s%N`、`sort -z`）
+  仍然只是"写对了"，不是"验过了"，见下方「已知边界」第一条。
 
 ---
 
@@ -461,12 +462,15 @@ G（停止后不能重启）互相牵制，任何一半被单方面改掉，另�
 
 ## 已知边界
 
-- `scripts/ci.sh`（Linux / macOS）按设计编写并做过逐条评审，但**未在 GCC/Clang 上实机跑过**——
-  本机只有 MSVC。已经验证过的是：脚本语法（`bash -n`）、缺编译器时的前置失败提示、
-  以及 Stage 2/3 在两个**不同 Python 解释器**（3.x anaconda 与 3.13）下都产出与 `generated/`
-  逐字节相同的文件。未验证的是 GCC 分支的 `-Werror` 行为与 macOS BSD userland 的边角
-  （`date +%s%N`、`sort -z` 两处已知陷阱已在脚本里绕开）。
-  这一点如实写在这里，而不是用一个没跑过的脚本冒充"跨平台已验证"。
+- `scripts/ci.sh` 已在 **Linux**（Ubuntu 26.04 / GCC 15.2）的全新克隆上实机跑通：四阶段全绿、
+  `13/13` 用例、`-Werror` 零警告、`CI_EXIT=0`。首次执行暴露并修掉了五个问题——脚本模式位
+  `100644`、缺 `<netdb.h>` 与 `<mutex>`（MSVC 靠传递包含掩盖）、`QZRPC_PYTHON` 默认裸名
+  `python`、一条赌线程调度顺序的线程池断言、以及 bash 侧缺 `CHECKS` 闸门。细节见
+  `.scratch/verify/LINUX-FIRST-RUN-2026-11-08.md`（未入库）。
+- **macOS / BSD userland 仍未实机验证**：`date +%s%N`、`sort -z` 两处已知陷阱已在脚本里绕开，
+  其它 BSD 边角没有跑过。Linux 侧只有 `-Werror` 被实测覆盖，Clang 分支不在其中。
+- 用例数在两个平台不同：Linux **13**、Windows **14**。差的 `interop_protobuf` 在没有 protobuf
+  运行时的机器上**不注册**（不是跳过），所以 Linux 上只能报 `13/13`。
 - 这台构建机上 **`Start-Process` 不可用**（环境里同时有 `HTTP_PROXY` 与 `http_proxy`，
   PowerShell 5.1 的 `env:` 驱动大小写敏感，`Start-Process` 枚举时报
   "An item with the same key has already been added"）。`scripts/` 下的脚本一律用
